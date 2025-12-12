@@ -35,9 +35,5 @@ class BonusCard(Card):
 
 
 class MainCard(Card):
+    id: int
     prerequisites: Prerequisites = Prerequisites()
-
-
-class PlayerField(BaseModel):
-    main_cards: list[MainCard] = []
-    bonus_cards: list[BonusCard] = []
