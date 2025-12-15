@@ -34,18 +34,24 @@ Requires Python 3.10+ and [Pydantic](https://docs.pydantic.dev/) v2.
 ## Usage
 
 ```python
-from faraway.data_structures import PlayerField, MainCard, BonusCard, Assets, Rewards, Prerequisites
+from faraway.data_structures import MainCard, BonusCard, Assets, Rewards, Prerequisites
+from faraway.player_field import PlayerField
 from faraway.final_count import final_count
 
 # Create a player's field with their cards (in play order)
 field = PlayerField(
     main_cards=[
-        MainCard(assets=Assets(red=1, rock=1)),
-        MainCard(assets=Assets(green=1, animal=1)),
+        MainCard(id=1, assets=Assets(red=1, rock=1)),
+        MainCard(id=2, assets=Assets(green=1, animal=1)),
         MainCard(
+            id=3,
             assets=Assets(blue=1),
             prerequisites=Prerequisites(animal=1),
             rewards=Rewards(flat=10)
+        ),
+        MainCard(
+            id=4,
+            assets=Assets(green=1, animal=1)
         ),
     ],
     bonus_cards=[

@@ -51,7 +51,7 @@ class BonusCard(Card):
 
 
 class MainCard(Card):
-    id: int
+    id: int = 0
     prerequisites: Prerequisites = Prerequisites()
 
     def flatten(self) -> np.ndarray:
