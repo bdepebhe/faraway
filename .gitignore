@@ -4,3 +4,4 @@ __pycache__/
 .coverage
 htmlcov/
 coverage.xml
+test_game.py
