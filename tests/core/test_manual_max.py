@@ -1,11 +1,12 @@
 """
 Tests on the set of cards manually chosen to maximize the final count.
 """
+
 import pytest
 
-from faraway.data_structures import BonusCard, MainCard
-from faraway.final_count import final_count
-from faraway.player_field import PlayerField
+from faraway.core.data_structures import BonusCard, MainCard
+from faraway.core.final_count import final_count
+from faraway.core.player_field import PlayerField
 
 IDEAL_MAIN_CARDS = [
     MainCard(**{"id": 18, "assets": {"green": 1, "animal": 1}, "rewards": {"all_4_colors": 10}}),

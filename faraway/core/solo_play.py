@@ -5,9 +5,9 @@ from abc import ABC, abstractmethod
 import numpy as np
 from loguru import logger
 
-from faraway.final_count import final_count
-from faraway.load_cards import load_bonus_cards, load_main_cards
-from faraway.player_field import PlayerField
+from faraway.core.final_count import final_count
+from faraway.core.load_cards import load_bonus_cards, load_main_cards
+from faraway.core.player_field import PlayerField
 
 
 class SoloPlay(ABC):
@@ -57,6 +57,7 @@ class SoloPlay(ABC):
             logger.info(f"Average score: {np.mean(results)}")
             logger.info(f"Minimum score: {np.min(results)}")
             logger.info(f"Maximum score: {np.max(results)}")
+        if self.verbose > 1:
             logger.info(f"Best card set: {best_card_set}")
         return results
 
@@ -86,9 +87,10 @@ if __name__ == "__main__":
     )
     parser.add_argument("--player_type", type=str, default="random", help="Type of player to use")
     parser.add_argument(
-        "--use_bonus_cards", type=bool, default=True, help="Whether to use bonus cards"
+        "--no_bonus_cards", action="store_true", help="Number of bonus cards to use"
     )
     parser.add_argument("--log_to_file", action="store_true", help="Whether to log to a file")
+    parser.add_argument("--model_path", type=str, default=None, help="Path to the model to load")
     parser.add_argument("--verbose", type=int, default=1, help="Verbosity level")
     args = parser.parse_args()
 
@@ -97,7 +99,11 @@ if __name__ == "__main__":
     else:
         logger.add(sys.stdout)
     if args.player_type == "random":
-        solo_play = RandomSoloPlay(verbose=args.verbose)
+        solo_play = RandomSoloPlay(verbose=args.verbose, use_bonus_cards=not args.no_bonus_cards)
     else:
         raise ValueError(f"Invalid player type: {args.player_type}")
-    solo_play.run_multiple_simulations(n_simulations=args.n_simulations)
+    results = solo_play.run_multiple_simulations(n_simulations=args.n_simulations)
+    if args.verbose:
+        logger.info(f"Average score: {np.mean(results)}")
+        logger.info(f"Minimum score: {np.min(results)}")
+        logger.info(f"Maximum score: {np.max(results)}")
