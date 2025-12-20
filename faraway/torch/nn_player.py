@@ -23,7 +23,6 @@ class NNPlayer(BasePlayer):
         super().__init__(n_rounds, model_params, n_cards_hand, use_bonus_cards)
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        self.cards_hand: torch.Tensor | None = None
         self.state_length = (
             MainCard.length() * (self.n_rounds + self.n_bonus_cards)  # previous cards
             + 1  # round index
