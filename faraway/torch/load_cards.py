@@ -22,8 +22,8 @@ def load_bonus_deck_tensor() -> torch.Tensor:
     # load the pydantic deck
     bonus_deck = load_bonus_cards()
     # cast into maincard features to have the same indices as the main cards
-    # NOTE: bonus cards have no id. We use -1 to indicate them to the model
-    bonus_deck_as_main_cards = [MainCard(**card.model_dump(), id=-1) for card in bonus_deck]
+    # NOTE: bonus cards have no id. We use 99 to indicate them to the model
+    bonus_deck_as_main_cards = [MainCard(**card.model_dump(), id=99) for card in bonus_deck]
     # convert to tensor
     bonus_deck_tensor = torch.stack(
         [torch.tensor(card.flatten(), dtype=torch.float32) for card in bonus_deck_as_main_cards]

@@ -20,6 +20,21 @@ class Prerequisites(BaseModel):
         return cls(**{name: int(numpy_array[i]) for i, name in enumerate(field_names)})
 
 
+SHORT_PARAMS_NAMES = {
+    "rock": "K",
+    "animal": "A",
+    "vegetal": "V",
+    "red": "R",
+    "green": "G",
+    "blue": "B",
+    "yellow": "Y",
+    "night": "N",
+    "map": "M",
+    "all_4_colors": "4C",
+    "flat": "F",
+}
+
+
 class Assets(Prerequisites):
     red: int = 0
     green: int = 0
@@ -62,8 +77,8 @@ class BonusCard(Card):
                 f"Prerequisites are not all 0. It doesnt seem to be a bonus card. "
                 f"Prerequisites: {main_card.prerequisites}"
             )
-        # if main_card.id != -1:
-        #     raise ValueError(f"Id is not -1. It doesnt seem to be a bonus card.)
+        # if main_card.id != 99:
+        #     raise ValueError(f"Id is not 99. It doesnt seem to be a bonus card.)
         return cls(assets=main_card.assets, rewards=main_card.rewards)
 
 
@@ -98,3 +113,52 @@ class MainCard(Card):
             numpy_array[position : position + Prerequisites.length()]
         )
         return cls(id=id, assets=assets, rewards=rewards, prerequisites=prerequisites)
+
+    @classmethod
+    def get_field_index(cls, field_name: str, section: str = "assets") -> int:
+        """Get the index of a field in the card, after flattening the card."""
+        offset = 1  # for id
+        if section == "assets":
+            return offset + list(Assets.model_fields.keys()).index(field_name)
+        elif section == "rewards":
+            offset += Assets.length()
+            return offset + list(Rewards.model_fields.keys()).index(field_name)
+        elif section == "prerequisites":
+            offset += Assets.length() + Rewards.length()
+            return offset + list(Prerequisites.model_fields.keys()).index(field_name)
+        else:
+            raise ValueError(f"Unknown section: {section}")
+
+    def __str__(self) -> str:
+        result = f"{self.id}/"
+        for asset, value in self.assets.model_dump().items():
+            if value > 0:
+                result += f"{SHORT_PARAMS_NAMES[asset]}"
+            if value > 1:
+                result += f"{value}"
+        result += "/"
+        for prerequisite, value in self.prerequisites.model_dump().items():
+            if value > 0:
+                result += f"{SHORT_PARAMS_NAMES[prerequisite]}"
+            if value > 1:
+                result += f"{value}"
+        result += "/"
+        for reward, value in self.rewards.model_dump().items():
+            if value > 0:
+                result += f"{SHORT_PARAMS_NAMES[reward]}"
+            if value > 1:
+                result += f"{value}"
+        return result
+
+
+class MainCardsSeries:
+    def __init__(self, list_of_main_cards: list[MainCard]):
+        self.list_of_main_cards = list_of_main_cards
+
+    @classmethod
+    def from_numpy(cls, numpy_array: np.ndarray) -> "MainCardsSeries":
+        list_of_main_cards = [MainCard.from_numpy(card) for card in numpy_array]
+        return cls(list_of_main_cards)
+
+    def __str__(self) -> str:
+        return f"[{' '.join(f'{card}' for card in self.list_of_main_cards)}]"
