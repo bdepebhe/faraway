@@ -20,7 +20,7 @@ class NNPlayer(BasePlayer):
         use_cards_hand_in_state: bool = False,
         use_draft_indicator_in_model_input: bool = False,
     ):
-        super().__init__(n_rounds, model_params, n_cards_hand, use_bonus_cards)
+        super().__init__(n_rounds, n_cards_hand, use_bonus_cards)
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         self.state_length = (
