@@ -1,5 +1,17 @@
-from faraway.count_utils import compute_value, validate_prerequisites
-from faraway.player_field import PlayerField
+from faraway.core.data_structures import (
+    Prerequisites,
+    Rewards,
+    SummedAssets,
+)
+from faraway.core.player_field import PlayerField
+
+
+def validate_prerequisites(prerequisites: Prerequisites, assets: SummedAssets) -> bool:
+    return all(getattr(assets, key) >= value for key, value in prerequisites.model_dump().items())
+
+
+def compute_value(rewards: Rewards, assets: SummedAssets) -> int:
+    return sum(getattr(assets, key) * reward for key, reward in rewards.model_dump().items())
 
 
 def final_count(field: PlayerField) -> int:

@@ -15,6 +15,12 @@ test-v:
 cov:
 	uv run pytest --cov=faraway --cov-report=term-missing
 
+badge:
+	uv run pytest --cov=faraway --cov-report=xml
+	@# Truncate line-rate to 2 decimal places (displays as whole %) to avoid flaky badge diffs
+	sed -i '' 's/line-rate="0\.\([0-9][0-9]\)[0-9]*"/line-rate="0.\1"/g' coverage.xml
+	uv run genbadge coverage -i coverage.xml -o assets/coverage-badge.svg
+
 lint:
 	uv run ruff check .
 

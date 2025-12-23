@@ -1,6 +1,6 @@
 import json
 
-from faraway.data_structures import BonusCard, MainCard
+from faraway.core.data_structures import BonusCard, MainCard
 
 
 def load_main_cards(path: str = "data/main_cards.json") -> list[MainCard]:

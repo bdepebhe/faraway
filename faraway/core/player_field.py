@@ -1,7 +1,21 @@
+from collections.abc import Sequence
+
 from pydantic import BaseModel
 
-from faraway.count_utils import sum_assets
-from faraway.data_structures import BonusCard, MainCard, SummedAssets
+from faraway.core.data_structures import Assets, BonusCard, Card, MainCard, SummedAssets
+
+
+def sum_assets(cards: Sequence[Card]) -> SummedAssets:
+    summed_assets = {}
+    for key in Assets.model_fields:
+        summed_assets[key] = sum(getattr(card.assets, key) for card in cards)
+    all_4_colors = min(
+        summed_assets["red"],
+        summed_assets["green"],
+        summed_assets["blue"],
+        summed_assets["yellow"],
+    )
+    return SummedAssets(**summed_assets, all_4_colors=all_4_colors)
 
 
 class PlayerField(BaseModel):
