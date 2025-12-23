@@ -1,14 +1,16 @@
 """Base class for batched NN games."""
 
 from abc import ABC, abstractmethod
+from collections.abc import Sequence
 
 import torch
+from loguru import logger
 
+from faraway.core.base_player import BasePlayer
 from faraway.core.data_structures import BonusCard, MainCard
 from faraway.core.final_count import final_count
 from faraway.core.player_field import PlayerField
 from faraway.torch.load_cards import load_bonus_deck_tensor, load_main_deck_tensor
-from faraway.torch.player import NNPlayer
 
 # =============================================================================
 # Lazy-loaded global deck tensors
@@ -56,9 +58,11 @@ class BaseNNGame(ABC):
     Batched game using tensors.
 
     Attributes:
-        batch_size: Number of parallel games
         n_rounds: Number of rounds in the game
+        players: List of players in the game
+        use_bonus_cards: Whether to use bonus cards
         device: Torch device for tensors
+        verbose: Verbosity level
 
     Tensor shapes:
         main_field: (batch, 8, 24) - played main cards
@@ -80,12 +84,12 @@ class BaseNNGame(ABC):
         self,
         n_rounds: int = 8,
         use_bonus_cards: bool = True,
-        batch_size: int = 32,
         device: torch.device | None = None,
+        players: list[BasePlayer] | None = None,
+        verbose: int = 0,
     ):
         self.n_rounds = n_rounds
         self.use_bonus_cards = use_bonus_cards
-        self.batch_size = batch_size
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         main_deck = get_main_deck_tensor()
         bonus_deck = get_bonus_deck_tensor()
@@ -93,37 +97,37 @@ class BaseNNGame(ABC):
             "main": main_deck,
             "bonus": bonus_deck,
         }
-        self.n_main_cards = n_rounds
-        if self.use_bonus_cards:
-            self.n_bonus_cards = n_rounds - 1
-        else:
-            self.n_bonus_cards = 0
-        self.state_length = (
-            MainCard.length() * (self.n_main_cards + self.n_bonus_cards)  # previous cards
-            + 1  # round index
-        )
-        self.nn_input_size = self.state_length + MainCard.length()  # current card to choose
-        self.players: list[NNPlayer] = []
-        self.picked_probabilities: torch.Tensor
+        self.picked_probabilities: torch.Tensor  # (used for training only)
+
+        self.players: Sequence[BasePlayer] = players or []
+        # check that the players have the same number of rounds
+        self.verbose = verbose
 
     @abstractmethod
     def play_round(self) -> torch.Tensor:
         pass
 
-    def reset_games_batch(self) -> None:
+    def reset_games_batch(self, batch_size: int) -> None:
         main_deck_availability = torch.ones(
-            self.batch_size, self.decks["main"].shape[0], dtype=torch.bool, device=self.device
-        )  # (batch, n_main_cards)
+            batch_size, self.decks["main"].shape[0], dtype=torch.bool, device=self.device
+        )  # (batch, n_total_main_cards)
         bonus_deck_availability = torch.ones(
-            self.batch_size, self.decks["bonus"].shape[0], dtype=torch.bool, device=self.device
-        )  # (batch, n_bonus_cards)
+            batch_size, self.decks["bonus"].shape[0], dtype=torch.bool, device=self.device
+        )  # (batch, n_total_bonus_cards)
         self.deck_availability = {
             "main": main_deck_availability,
             "bonus": bonus_deck_availability,
         }
         for player in self.players:
-            player.reset_games_batch()
+            player.reset_games_batch(batch_size)
         self.round_index = 0
+
+    def get_used_cards_ids(self, type: str, game_id: int) -> list[int]:
+        used_cards_ids = [
+            1 + card_id
+            for card_id in torch.where(~self.deck_availability[type][game_id])[0].tolist()
+        ]
+        return used_cards_ids
 
     def get_scores(self) -> torch.Tensor:
         return torch.stack(
@@ -133,7 +137,7 @@ class BaseNNGame(ABC):
                         final_count_from_tensor_field(
                             player.fields["main"][i, :, :], player.fields["bonus"][i, :, :]
                         )
-                        for i in range(self.batch_size)
+                        for i in range(player.fields["main"].shape[0])
                     ],
                     dtype=torch.float32,
                     device=self.device,
@@ -143,8 +147,8 @@ class BaseNNGame(ABC):
             dim=1,
         )  # (batch, players)
 
-    def play_games_batch(self, learning_mode: bool = False) -> None:
-        self.reset_games_batch()
+    def play_games_batch(self, batch_size: int, learning_mode: bool = False) -> None:
+        self.reset_games_batch(batch_size)
         for _ in range(self.n_rounds):
             picked_probabilities = self.play_round()
             if learning_mode:
@@ -153,10 +157,14 @@ class BaseNNGame(ABC):
                     [self.picked_probabilities, picked_probabilities], dim=1
                 )
 
-    def play_games_batches(self, n_batches: int) -> torch.Tensor:
+    def play_games_batches(self, n_batches: int, batch_size: int) -> torch.Tensor:
+        if self.verbose > 0:
+            logger.info(f"Playing {n_batches} batches of {batch_size} games")
         batches_scores: list[torch.Tensor] = []
-        for _ in range(n_batches):
-            self.play_games_batch()
+        for i in range(n_batches):
+            self.play_games_batch(batch_size)
+            if self.verbose > 1:
+                logger.info(f"Batch {i + 1} completed")
             batches_scores.append(self.get_scores())
-        scores = torch.stack(batches_scores, dim=0)  # (n_batches * batch_size, players)
+        scores = torch.cat(batches_scores, dim=0)  # (n_batches * batch_size, players)
         return scores

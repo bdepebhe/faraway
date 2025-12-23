@@ -11,18 +11,17 @@ Tensor representations:
 - Deck availability tracked via index masks
 """
 
-import argparse
 import sys
 from datetime import datetime
-from typing import Any
+from typing import Annotated, Any
 
 import torch
+import typer
 from loguru import logger
 from torch.utils.tensorboard import SummaryWriter
 
 from faraway.torch.base_game import BaseNNGame
-from faraway.torch.models import create_mlp_model
-from faraway.torch.player import NNPlayer
+from faraway.torch.nn_player import NNPlayer
 
 
 def sample_cards_from_availability_tensor(
@@ -34,12 +33,11 @@ def sample_cards_from_availability_tensor(
     return torch.multinomial(availability_tensor, draft_size, replacement=False)
 
 
-class SoloNNGame(BaseNNGame):
+class SoloLearningGame(BaseNNGame):
     """
     Batched solo play game using tensors.
 
     Attributes:
-        batch_size: Number of parallel games
         n_rounds: Number of rounds in the game
         device: Torch device for tensors
 
@@ -69,21 +67,26 @@ class SoloNNGame(BaseNNGame):
         verbose: int = 1,
         prior_baseline_score: float = 29,
         update_baseline_rate: float = 0.05,
-        batch_size: int = 32,
         device: torch.device | None = None,
-        hidden_layers_sizes: list[int] = [512, 1024, 512],  # noqa: B006
-        dropout_rate: float = 0.1,
+        model_params: dict[str, Any] | None = None,
+        player_params: dict[str, Any] | None = None,
         experiment_name: str | None = None,
         log_dir: str = "runs",
     ):
-        super().__init__(n_rounds, use_bonus_cards, batch_size, device)
+        super().__init__(n_rounds, use_bonus_cards, device, verbose=verbose)
         self.draft_size = draft_size
         self.replace_remaining_cards = replace_remaining_cards
-        self.verbose = verbose
         self.prior_baseline_score = prior_baseline_score
         self.update_baseline_rate = update_baseline_rate
-        self.hidden_layers_sizes = hidden_layers_sizes
-        self.dropout_rate = dropout_rate
+        self.model_params = model_params or {
+            "hidden_layers_sizes": [512, 512],
+            "dropout_rate": 0.1,
+        }
+        self.player_params = player_params or {
+            "use_cards_hand_in_state": False,
+            "use_draft_indicator_in_model_input": False,
+        }
+        self.player_params["use_bonus_cards"] = self.use_bonus_cards
 
         # TensorBoard monitoring
         # total_games_played is the "epoch" metric - counts environment interactions
@@ -92,24 +95,35 @@ class SoloNNGame(BaseNNGame):
             experiment_name = f"faraway_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         self.experiment_name = experiment_name
         self.writer = SummaryWriter(log_dir=f"{log_dir}/{experiment_name}")
-        self.reset_learning()
+        self.reset_learning(model_path=model_path)
+        self.players: list[NNPlayer]
 
     def reset_learning(self, model_path: str | None = None) -> None:
+        if model_path is not None:
+            model = torch.load(model_path)
+        else:
+            model = None
         self.total_games_played = 0
         self.baseline = self.prior_baseline_score
         self.step_id = 0  # step id for TensorBoard
-        self.model = create_mlp_model(
-            self.nn_input_size, model_path, self.hidden_layers_sizes, self.dropout_rate
-        )
+
         self.players = [
             NNPlayer(
-                self.model, self.device, self.batch_size, self.n_main_cards, self.n_bonus_cards
+                model=model,
+                model_params=self.model_params,
+                device=self.device,
+                n_rounds=self.n_rounds,
+                **self.player_params,
             )
         ]  # only one player for solo play
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=0.0005)
+        self.optimizer = torch.optim.Adam(self.players[0].model.parameters(), lr=0.0005)
 
     def dump_model(self, model_path: str) -> None:
-        torch.save(self.model, model_path)
+        torch.save(self.players[0].model, model_path)
+
+    def dump_player(self, player_path: str) -> None:
+        """Save the player (model + config) to a file."""
+        self.players[0].dump(player_path)
 
     def close_tensorboard(self) -> None:
         """Close the TensorBoard writer. Call this when training is complete."""
@@ -118,72 +132,47 @@ class SoloNNGame(BaseNNGame):
     def log_hparams(self, extra_hparams: dict[str, Any] | None = None) -> None:
         """Log hyperparameters to TensorBoard for experiment comparison."""
         hparams = {
-            "batch_size": self.batch_size,
             "n_rounds": self.n_rounds,
             "draft_size": self.draft_size,
             "prior_baseline_score": self.prior_baseline_score,
             "use_bonus_cards": self.use_bonus_cards,
             "replace_remaining_cards": self.replace_remaining_cards,
             # "hidden_layers_sizes": self.hidden_layers_sizes,
-            "dropout_rate": self.dropout_rate,
+            "dropout_rate": self.model_params["dropout_rate"],
+            "use_cards_hand_in_state": self.player_params["use_cards_hand_in_state"],
+            "use_draft_indicator_in_model_input": self.player_params[
+                "use_draft_indicator_in_model_input"
+            ],
         }
         if extra_hparams:
             hparams.update(extra_hparams)
         self.writer.add_hparams(hparams, {})
 
     def _play_card(self, type: str) -> torch.Tensor:
+        batch_size = self.players[0].get_current_batch_size()
         # select indices of cards to sample from the main deck
         indices = torch.multinomial(
             self.deck_availability[type].float(), self.draft_size, replacement=False
         )  # (batch, draft_size)
         # sample the cards
         possible_cards_tensor = self.decks[type][indices]  # (batch, draft_size, MainCard.length())
-        # prepare the state tensor
-        fields = torch.concat(
-            [self.players[0].fields["main"], self.players[0].fields["bonus"]], dim=1
+        probabilities, index, selected_cards = self.players[0].evaluate_cards(
+            possible_cards_tensor, self.round_index
         )
-        flattened_state = torch.flatten(fields, start_dim=1)  # (batch, (8+6)*24)
-        # append the round index
-        round_index_tensor = torch.tensor(
-            [[self.round_index] * self.batch_size], device=self.device
-        ).T
-        state_tensor = torch.concat(
-            [flattened_state, round_index_tensor], dim=1
-        )  # (batch, (8+6)*24 + 1)
-        # expand the state tensor for each possible card
-        expanded_state_tensor = state_tensor.unsqueeze(1).expand(
-            -1, possible_cards_tensor.shape[1], -1
-        )  # (batch, draft_size, (8+6)*24 + 1)
-        # concatenate the state tensor with the possible cards tensor
-        input_tensor = torch.concat(
-            [expanded_state_tensor, possible_cards_tensor], dim=2
-        )  # (batch, draft_size, (8+6)*24 + 1 + MainCard.length())
-        # pass the input tensor through the model
-        logits = self.model(input_tensor).squeeze(dim=2)  # (batch, draft_size)
-        # take softmax to get probabilities
-        probabilities = torch.softmax(logits, dim=1)  # (batch, draft_size)
-        # sample from probabilities
-        index = torch.multinomial(probabilities, 1)  # (batch,)
-        # add the played card to the main field
-        index_expanded = index.unsqueeze(2).expand(
-            -1, -1, possible_cards_tensor.shape[2]
-        )  # (batch, 1, card_length)
-        selected_cards = torch.gather(possible_cards_tensor, 1, index_expanded).squeeze(
-            1
-        )  # (batch, card_length)
         if type == "bonus":
             # for playing a bonus card, it depends on the previous main card
             batches_indices_where_card_played = torch.where(
                 self.players[0].fields["main"][:, self.round_index, 0]
                 > self.players[0].fields["main"][:, self.round_index - 1, 0]
             )[0]
+            self.players[0].fields[type][
+                batches_indices_where_card_played, self.round_index - 1, :
+            ] = selected_cards[batches_indices_where_card_played]
         elif type == "main":
-            batches_indices_where_card_played = torch.arange(self.batch_size, device=self.device)
-        position_to_insert = {"main": self.round_index, "bonus": self.round_index - 1}[type]
-        # add the card to the field except for last bonus card
-        self.players[0].fields[type][batches_indices_where_card_played, position_to_insert, :] = (
-            selected_cards[batches_indices_where_card_played]
-        )
+            # all batches play a main card every round
+            batches_indices_where_card_played = torch.arange(batch_size, device=self.device)
+            self.players[0].play_main_card(selected_cards, self.round_index)
+
         # update availability tensor
         if self.replace_remaining_cards:
             # only switch the played card to 0
@@ -197,7 +186,7 @@ class SoloNNGame(BaseNNGame):
             self.deck_availability[type].scatter_(1, indices, False)
         # get the probability of the selected card
         # (1 if no card played, so log(1)=0 won't affect the loss)
-        probability = torch.ones(self.batch_size, device=self.device)
+        probability = torch.ones(batch_size, device=self.device)
         probability[batches_indices_where_card_played] = torch.gather(
             probabilities, 1, index
         ).squeeze(1)[batches_indices_where_card_played]  # (batch,)
@@ -219,11 +208,11 @@ class SoloNNGame(BaseNNGame):
         self.round_index += 1
         return picked_probabilities
 
-    def learning_step(self) -> None:
+    def learning_step(self, batch_size: int = 32) -> None:
         # empty probas tensor for training. dim 0 is batch, but no values
-        self.picked_probabilities = torch.ones(self.batch_size, 0, device=self.device)
+        self.picked_probabilities = torch.ones(batch_size, 0, device=self.device)
         # play the game and get the log probabilities
-        self.play_games_batch(learning_mode=True)
+        self.play_games_batch(batch_size, learning_mode=True)
         log_probs = torch.log(self.picked_probabilities)  # (batch, n_rounds)
         # apply final_count_from_tensor_field for each element of the batch
         scores = self.get_scores()[:, 0]
@@ -235,7 +224,7 @@ class SoloNNGame(BaseNNGame):
         self.optimizer.step()
 
         # Update total games played (epoch metric based on environment interactions)
-        self.total_games_played += self.batch_size
+        self.total_games_played += batch_size
 
         # Log metrics to TensorBoard
         # Using total_games_played as x-axis for fair comparison across batch sizes
@@ -264,57 +253,64 @@ class SoloNNGame(BaseNNGame):
         self.step_id += 1
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--log_to_file", action="store_true", help="Whether to log to a file")
-    parser.add_argument(
-        "--experiment_name", type=str, default=None, help="Name for TensorBoard experiment"
-    )
-    parser.add_argument("--batch_size", type=int, default=32, help="Training batch size")
-    parser.add_argument("--n_steps", type=int, default=1000, help="Number of training steps")
-    parser.add_argument(
-        "--n_eval_batches", type=int, default=100, help="Number of evaluation batches"
-    )
-    args = parser.parse_args()
-
-    if args.log_to_file:
+def main(
+    log_to_file: Annotated[bool, typer.Option(help="Whether to log to a file")] = False,
+    experiment_name: Annotated[
+        str | None, typer.Option(help="Name for TensorBoard experiment")
+    ] = None,
+    batch_size: Annotated[int, typer.Option(help="Training batch size")] = 32,
+    draft_size: Annotated[int, typer.Option(help="Draft size")] = 10,
+    n_steps: Annotated[int, typer.Option(help="Number of training steps")] = 1000,
+    n_eval_batches: Annotated[int, typer.Option(help="Number of evaluation batches")] = 100,
+) -> None:
+    """Run a solo learning game."""
+    logger.remove()  # remove default stderr handler
+    if log_to_file:
         logger.add("faraway.log")
     else:
         logger.add(sys.stdout)
 
-    game = SoloNNGame(
+    game = SoloLearningGame(
         verbose=2,
         prior_baseline_score=29,
-        batch_size=args.batch_size,
-        experiment_name=args.experiment_name,
-        dropout_rate=0.1,
-        draft_size=10,
-        hidden_layers_sizes=[512, 1024, 512],
+        experiment_name=experiment_name,
+        model_params={
+            "hidden_layers_sizes": [512, 512],
+            "dropout_rate": 0.1,
+        },
+        player_params={
+            "use_cards_hand_in_state": False,
+            "use_draft_indicator_in_model_input": False,
+        },
+        draft_size=draft_size,
     )
 
     # Log hyperparameters for experiment comparison
-    game.log_hparams({"n_steps": args.n_steps, "learning_rate": 0.0005})
+    game.log_hparams({"n_steps": n_steps, "learning_rate": 0.0005, "batch_size": batch_size})
 
     # Initial evaluation
-    initial_scores = game.play_games_batches(n_batches=args.n_eval_batches)
+    initial_scores = game.play_games_batches(n_batches=n_eval_batches, batch_size=batch_size)
     logger.info(
         f"Initial score: {initial_scores.mean().item():.2f}. Best: {initial_scores.max().item()}"
     )
 
     # Training
-    game.batch_size = args.batch_size
-    for _ in range(args.n_steps):
-        game.learning_step()
+    for _ in range(n_steps):
+        game.learning_step(batch_size=batch_size)
 
     # Final evaluation
-    final_scores = game.play_games_batches(n_batches=args.n_eval_batches)
+    final_scores = game.play_games_batches(n_batches=n_eval_batches, batch_size=batch_size)
     logger.info(f"Final score: {final_scores.mean().item():.2f}. Best: {final_scores.max().item()}")
 
     # Log final metrics
     game.writer.add_scalar("eval/initial_score", initial_scores.mean().item(), 0)
     game.writer.add_scalar("eval/final_score", final_scores.mean().item(), game.total_games_played)
 
-    game.dump_model(f"runs/{game.experiment_name}/faraway_model.pt")
+    game.dump_player(f"runs/{game.experiment_name}/faraway_player.pt")
     game.close_tensorboard()
     print(f"\nTensorBoard logs saved to: runs/{game.experiment_name}")
     print("Run 'tensorboard --logdir=runs' to view results")
+
+
+if __name__ == "__main__":
+    typer.run(main)
