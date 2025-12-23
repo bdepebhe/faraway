@@ -21,6 +21,7 @@ class BasePlayer(ABC):
         else:
             self.n_bonus_cards = 0
         self.n_cards_hand = n_cards_hand
+        self.cards_hand: np.ndarray = np.zeros((0, n_cards_hand, MainCard.length()))
 
     def reset_games_batch(self, batch_size: int) -> None:
         main_fields = np.zeros(

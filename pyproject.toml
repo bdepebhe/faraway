@@ -8,6 +8,7 @@ dependencies = [
     "pydantic>=2.0",
     "numpy",
     "loguru",
+    "typer>=0.20.1",
 ]
 
 [project.optional-dependencies]
