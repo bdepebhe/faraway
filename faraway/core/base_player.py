@@ -1,5 +1,4 @@
 from abc import ABC, abstractmethod
-from typing import Any
 
 import numpy as np
 
@@ -10,7 +9,6 @@ class BasePlayer(ABC):
     def __init__(
         self,
         n_rounds: int,
-        model_params: dict[str, Any] | None = None,
         n_cards_hand: int = 3,
         use_bonus_cards: bool = True,
     ):

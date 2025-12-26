@@ -11,6 +11,7 @@ from loguru import logger
 
 from faraway.core.base_player import BasePlayer
 from faraway.core.data_structures import MainCard, MainCardsSeries
+from faraway.core.human_player import HumanPlayer
 from faraway.torch.base_game import BaseNNGame
 from faraway.torch.nn_player import NNPlayer
 
@@ -233,7 +234,7 @@ class RealNNGame(BaseNNGame):
             # check if the previously played card is lower than the current card
             if (
                 player.fields["main"][game_id, self.round_index, 0]
-                > self.players[0].fields["main"][game_id, self.round_index - 1, 0]
+                > player.fields["main"][game_id, self.round_index - 1, 0]
             ):
                 # cap to available bonus cards
                 n_available = self.deck_availability["bonus"][game_id, :].sum().item()
@@ -310,7 +311,7 @@ class RealNNGame(BaseNNGame):
         if self.verbose > 0:
             logger.info(
                 f"Tournament completed.\n"
-                f"Mean scores: {mean_scores.tolist()}\n"
+                f"Mean scores: {mean_scores}\n"
                 f"Wins: {wins}\n"
                 f"Win rate: {win_rate}%\n"
             )
@@ -338,8 +339,17 @@ def main(
     # load the players
     players_list: list[BasePlayer] = []
     for player in players or []:
-        players_list.append(NNPlayer.load(player))
-
+        if player.endswith(".pt"):
+            players_list.append(NNPlayer.load(player))
+        elif player == "human":
+            players_list.append(HumanPlayer(n_rounds))
+        else:
+            raise ValueError(f"Unknown player type: {player}")
+        if players_list[-1].n_rounds != n_rounds:
+            raise ValueError(
+                f"Player {players_list[-1]} has {players_list[-1].n_rounds} rounds, but "
+                f"current game has {n_rounds} rounds"
+            )
     game = RealNNGame(
         players=players_list,
         n_rounds=n_rounds,
