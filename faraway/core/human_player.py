@@ -32,11 +32,16 @@ class HumanPlayer(BasePlayer):
             )
             # Ask the human player to select a card
             answer = "None"
-            while eval(answer) not in range(possible_cards.shape[1]):
-                try:
-                    answer = input(f"Select a card index [0-{possible_cards.shape[1]-1}]: ")
-                except ValueError:
-                    pass
+            if possible_cards.shape[1] == 1:
+                # only one choice, just ask the user to press enter to select 0
+                answer = "0"
+                _ = input("Press Enter to select the only possible card")
+            else:
+                while eval(answer) not in range(possible_cards.shape[1]):
+                    try:
+                        answer = input(f"Select a card index [0-{possible_cards.shape[1]-1}]: ")
+                    except ValueError:
+                        pass
             index[game_index] = int(answer)
             probabilities[game_index, index[game_index]] = 1.0
             selected_cards[game_index] = possible_cards[game_index, index[game_index], :]
