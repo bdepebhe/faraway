@@ -139,7 +139,11 @@ class BaseNNGame(ABC):
                         )
                         for i in range(player.fields["main"].shape[0])
                     ],
+                    dtype=torch.float32,
                     device=self.device,
+                )
+                for player in self.players
+            ],
             dim=1,
         )  # (batch, players)
 

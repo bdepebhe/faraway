@@ -234,7 +234,7 @@ class RealNNGame(BaseNNGame):
             # check if the previously played card is lower than the current card
             if (
                 player.fields["main"][game_id, self.round_index, 0]
-                > self.players[0].fields["main"][game_id, self.round_index - 1, 0]
+                > player.fields["main"][game_id, self.round_index - 1, 0]
             ):
                 # cap to available bonus cards
                 n_available = self.deck_availability["bonus"][game_id, :].sum().item()
@@ -311,7 +311,7 @@ class RealNNGame(BaseNNGame):
         if self.verbose > 0:
             logger.info(
                 f"Tournament completed.\n"
-                f"Mean scores: {mean_scores.tolist()}\n"
+                f"Mean scores: {mean_scores}\n"
                 f"Wins: {wins}\n"
                 f"Win rate: {win_rate}%\n"
             )
