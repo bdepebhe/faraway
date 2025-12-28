@@ -12,13 +12,11 @@ Tensor representations:
 """
 
 import sys
-from datetime import datetime
 from typing import Annotated, Any
 
 import torch
 import typer
 from loguru import logger
-from torch.utils.tensorboard import SummaryWriter
 
 from faraway.torch.base_game import BaseNNGame
 from faraway.torch.nn_player import NNPlayer
@@ -73,7 +71,14 @@ class SoloLearningGame(BaseNNGame):
         experiment_name: str | None = None,
         log_dir: str = "runs",
     ):
-        super().__init__(n_rounds, use_bonus_cards, device, verbose=verbose)
+        super().__init__(
+            n_rounds,
+            use_bonus_cards,
+            device,
+            verbose=verbose,
+            experiment_name=experiment_name,
+            log_dir=log_dir,
+        )
         self.draft_size = draft_size
         self.replace_remaining_cards = replace_remaining_cards
         self.prior_baseline_score = prior_baseline_score
@@ -88,13 +93,8 @@ class SoloLearningGame(BaseNNGame):
         }
         self.player_params["use_bonus_cards"] = self.use_bonus_cards
 
-        # TensorBoard monitoring
-        # total_games_played is the "epoch" metric - counts environment interactions
-        # This allows fair comparison between experiments with different batch sizes
-        if experiment_name is None:
-            experiment_name = f"faraway_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        self.experiment_name = experiment_name
-        self.writer = SummaryWriter(log_dir=f"{log_dir}/{experiment_name}")
+        # Initialize TensorBoard (uses base class method)
+        self.init_tensorboard()
         self.reset_learning(model_path=model_path)
         self.players: list[NNPlayer]
 
@@ -103,7 +103,7 @@ class SoloLearningGame(BaseNNGame):
             model = torch.load(model_path)
         else:
             model = None
-        self.total_games_played = 0
+        self.total_games_played = 0  # reset game counter
         self.baseline = self.prior_baseline_score
         self.step_id = 0  # step id for TensorBoard
 
@@ -125,10 +125,6 @@ class SoloLearningGame(BaseNNGame):
         """Save the player (model + config) to a file."""
         self.players[0].dump(player_path)
 
-    def close_tensorboard(self) -> None:
-        """Close the TensorBoard writer. Call this when training is complete."""
-        self.writer.close()
-
     def log_hparams(self, extra_hparams: dict[str, Any] | None = None) -> None:
         """Log hyperparameters to TensorBoard for experiment comparison."""
         hparams = {
@@ -146,7 +142,8 @@ class SoloLearningGame(BaseNNGame):
         }
         if extra_hparams:
             hparams.update(extra_hparams)
-        self.writer.add_hparams(hparams, {})
+        if self.writer is not None:
+            self.writer.add_hparams(hparams, {})
 
     def _play_card(self, type: str) -> torch.Tensor:
         batch_size = self.players[0].get_current_batch_size()
@@ -228,15 +225,18 @@ class SoloLearningGame(BaseNNGame):
 
         # Log metrics to TensorBoard
         # Using total_games_played as x-axis for fair comparison across batch sizes
-        self.writer.add_scalar("score/mean", scores.mean().item(), self.total_games_played)
-        self.writer.add_scalar("score/max", scores.max().item(), self.total_games_played)
-        self.writer.add_scalar("score/min", scores.min().item(), self.total_games_played)
-        self.writer.add_scalar("score/std", scores.std().item(), self.total_games_played)
-        self.writer.add_scalar("baseline/value", self.baseline, self.total_games_played)
-        self.writer.add_scalar("advantage/mean", advantage.mean().item(), self.total_games_played)
-        self.writer.add_scalar("advantage/std", advantage.std().item(), self.total_games_played)
-        self.writer.add_scalar("loss/policy", loss.item(), self.total_games_played)
-        self.writer.add_scalar("step_id", self.step_id, self.total_games_played)
+        if self.writer is not None:
+            self.writer.add_scalar("score/mean", scores.mean().item(), self.total_games_played)
+            self.writer.add_scalar("score/max", scores.max().item(), self.total_games_played)
+            self.writer.add_scalar("score/min", scores.min().item(), self.total_games_played)
+            self.writer.add_scalar("score/std", scores.std().item(), self.total_games_played)
+            self.writer.add_scalar("baseline/value", self.baseline, self.total_games_played)
+            self.writer.add_scalar(
+                "advantage/mean", advantage.mean().item(), self.total_games_played
+            )
+            self.writer.add_scalar("advantage/std", advantage.std().item(), self.total_games_played)
+            self.writer.add_scalar("loss/policy", loss.item(), self.total_games_played)
+            self.writer.add_scalar("step_id", self.step_id, self.total_games_played)
 
         if self.verbose > 0:
             logger.info(
@@ -303,10 +303,13 @@ def main(
     logger.info(f"Final score: {final_scores.mean().item():.2f}. Best: {final_scores.max().item()}")
 
     # Log final metrics
-    game.writer.add_scalar("eval/initial_score", initial_scores.mean().item(), 0)
-    game.writer.add_scalar("eval/final_score", final_scores.mean().item(), game.total_games_played)
+    if game.writer is not None:
+        game.writer.add_scalar("eval/initial_solo_score", initial_scores.mean().item(), 0)
+        game.writer.add_scalar(
+            "eval/final_solo_score", final_scores.mean().item(), game.total_games_played
+        )
 
-    game.dump_player(f"runs/{game.experiment_name}/faraway_player.pt")
+    game.dump_player(f"runs/{game.experiment_name}/player.pt")
     game.close_tensorboard()
     print(f"\nTensorBoard logs saved to: runs/{game.experiment_name}")
     print("Run 'tensorboard --logdir=runs' to view results")
