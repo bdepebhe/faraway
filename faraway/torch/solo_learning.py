@@ -19,7 +19,8 @@ import typer
 from loguru import logger
 
 from faraway.torch.base_game import BaseNNGame
-from faraway.torch.nn_player import NNPlayer
+from faraway.torch.mlp_player import MLPPlayer
+from faraway.torch.nn_player import BaseNNPlayer
 
 
 def sample_cards_from_availability_tensor(
@@ -67,7 +68,9 @@ class SoloLearningGame(BaseNNGame):
         update_baseline_rate: float = 0.05,
         device: torch.device | None = None,
         model_params: dict[str, Any] | None = None,
+        player_type: str = "mlp",
         player_params: dict[str, Any] | None = None,
+        optimizer_params: dict[str, Any] | None = None,
         experiment_name: str | None = None,
         log_dir: str = "runs",
     ):
@@ -87,16 +90,20 @@ class SoloLearningGame(BaseNNGame):
             "hidden_layers_sizes": [512, 512],
             "dropout_rate": 0.1,
         }
+        self.player_type = player_type
         self.player_params = player_params or {
             "use_cards_hand_in_state": False,
             "use_draft_indicator_in_model_input": False,
+        }
+        self.optimizer_params = optimizer_params or {
+            "lr": 0.001,
         }
         self.player_params["use_bonus_cards"] = self.use_bonus_cards
 
         # Initialize TensorBoard (uses base class method)
         self.init_tensorboard()
         self.reset_learning(model_path=model_path)
-        self.players: list[NNPlayer]
+        self.players: list[BaseNNPlayer]
 
     def reset_learning(self, model_path: str | None = None) -> None:
         if model_path is not None:
@@ -107,16 +114,21 @@ class SoloLearningGame(BaseNNGame):
         self.baseline = self.prior_baseline_score
         self.step_id = 0  # step id for TensorBoard
 
-        self.players = [
-            NNPlayer(
-                model=model,
-                model_params=self.model_params,
-                device=self.device,
-                n_rounds=self.n_rounds,
-                **self.player_params,
-            )
-        ]  # only one player for solo play
-        self.optimizer = torch.optim.Adam(self.players[0].model.parameters(), lr=0.0005)
+        if self.player_type == "mlp":
+            self.players = [
+                MLPPlayer(
+                    model=model,
+                    model_params=self.model_params,
+                    device=self.device,
+                    n_rounds=self.n_rounds,
+                    **self.player_params,
+                )
+            ]  # only one player for solo play
+        else:
+            raise ValueError(f"Unknown player type: {self.player_type}")
+        self.optimizer = torch.optim.Adam(
+            self.players[0].model.parameters(), **self.optimizer_params
+        )
 
     def dump_model(self, model_path: str) -> None:
         torch.save(self.players[0].model, model_path)
@@ -226,10 +238,18 @@ class SoloLearningGame(BaseNNGame):
         # Log metrics to TensorBoard
         # Using total_games_played as x-axis for fair comparison across batch sizes
         if self.writer is not None:
-            self.writer.add_scalar("score/mean", scores.mean().item(), self.total_games_played)
-            self.writer.add_scalar("score/max", scores.max().item(), self.total_games_played)
-            self.writer.add_scalar("score/min", scores.min().item(), self.total_games_played)
-            self.writer.add_scalar("score/std", scores.std().item(), self.total_games_played)
+            self.writer.add_scalar(
+                "solo_train_score/mean", scores.mean().item(), self.total_games_played
+            )
+            self.writer.add_scalar(
+                "solo_train_score/max", scores.max().item(), self.total_games_played
+            )
+            self.writer.add_scalar(
+                "solo_train_score/min", scores.min().item(), self.total_games_played
+            )
+            self.writer.add_scalar(
+                "solo_train_score/std", scores.std().item(), self.total_games_played
+            )
             self.writer.add_scalar("baseline/value", self.baseline, self.total_games_played)
             self.writer.add_scalar(
                 "advantage/mean", advantage.mean().item(), self.total_games_played
@@ -282,11 +302,14 @@ def main(
             "use_cards_hand_in_state": False,
             "use_draft_indicator_in_model_input": False,
         },
+        optimizer_params={
+            "lr": 0.001,
+        },
         draft_size=draft_size,
     )
 
     # Log hyperparameters for experiment comparison
-    game.log_hparams({"n_steps": n_steps, "learning_rate": 0.0005, "batch_size": batch_size})
+    game.log_hparams({"n_steps": n_steps, "batch_size": batch_size, **game.optimizer_params})
 
     # Initial evaluation
     initial_scores = game.play_games_batches(n_batches=n_eval_batches, batch_size=batch_size)
@@ -304,9 +327,9 @@ def main(
 
     # Log final metrics
     if game.writer is not None:
-        game.writer.add_scalar("eval/initial_solo_score", initial_scores.mean().item(), 0)
+        game.writer.add_scalar("eval/solo_score", initial_scores.mean().item(), 0)
         game.writer.add_scalar(
-            "eval/final_solo_score", final_scores.mean().item(), game.total_games_played
+            "eval/solo_score", final_scores.mean().item(), game.total_games_played
         )
 
     game.dump_player(f"runs/{game.experiment_name}/player.pt")

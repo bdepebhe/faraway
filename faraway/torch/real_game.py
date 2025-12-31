@@ -13,7 +13,7 @@ from faraway.core.base_player import BasePlayer
 from faraway.core.data_structures import MainCard, MainCardsSeries
 from faraway.core.human_player import HumanPlayer
 from faraway.torch.base_game import BaseNNGame
-from faraway.torch.nn_player import NNPlayer
+from faraway.torch.nn_player import BaseNNPlayer
 
 MAP_INDEX_IN_FLATTENED_CARD = MainCard.get_field_index("map", "assets")
 
@@ -194,7 +194,7 @@ class RealNNGame(BaseNNGame):
 
     def resolve_actions_one_player(
         self,
-        player: NNPlayer,
+        player: BaseNNPlayer,
         draft_pool: torch.Tensor,
         index_played_from_hand: int,
         n_bonus_cards_to_draw: int,
@@ -326,7 +326,7 @@ def main(
     player_names: list[str] = []
     for player in players or []:
         if player.endswith(".pt"):
-            players_list.append(NNPlayer.load(player))
+            players_list.append(BaseNNPlayer.load(player))
             # Extract a short name from the path for TensorBoard labels
             player_names.append(player.replace("/", "_").replace(".pt", ""))
         elif player == "human":
