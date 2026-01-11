@@ -21,6 +21,7 @@ from loguru import logger
 from faraway.torch.base_game import BaseNNGame
 from faraway.torch.mlp_player import MLPPlayer
 from faraway.torch.nn_player import BaseNNPlayer
+from faraway.torch.play_vs_random import play_vs_random
 
 
 def sample_cards_from_availability_tensor(
@@ -64,15 +65,16 @@ class SoloLearningGame(BaseNNGame):
         use_bonus_cards: bool = True,
         model_path: str | None = None,
         verbose: int = 1,
-        prior_baseline_score: float = 29,
-        update_baseline_rate: float = 0.05,
         device: torch.device | None = None,
         model_params: dict[str, Any] | None = None,
         player_type: str = "mlp",
         player_params: dict[str, Any] | None = None,
         optimizer_params: dict[str, Any] | None = None,
+        rl_params: dict[str, Any] | None = None,
         experiment_name: str | None = None,
         log_dir: str = "runs",
+        eval_vs_random_config: dict[str, Any] | None = None,
+        eval_solo_config: dict[str, Any] | None = None,
     ):
         super().__init__(
             n_rounds,
@@ -84,8 +86,6 @@ class SoloLearningGame(BaseNNGame):
         )
         self.draft_size = draft_size
         self.replace_remaining_cards = replace_remaining_cards
-        self.prior_baseline_score = prior_baseline_score
-        self.update_baseline_rate = update_baseline_rate
         self.model_params = model_params or {
             "hidden_layers_sizes": [512, 512],
             "dropout_rate": 0.1,
@@ -98,7 +98,16 @@ class SoloLearningGame(BaseNNGame):
         self.optimizer_params = optimizer_params or {
             "lr": 0.001,
         }
+        self.rl_params = rl_params or {
+            "prior_baseline_score": 29,
+            "train_batch_size": 32,
+            "update_baseline_rate": 0.05,
+        }
         self.player_params["use_bonus_cards"] = self.use_bonus_cards
+
+        # Evaluation config
+        self.eval_vs_random_config = eval_vs_random_config or {}
+        self.eval_solo_config = eval_solo_config or {}
 
         # Initialize TensorBoard (uses base class method)
         self.init_tensorboard()
@@ -110,8 +119,7 @@ class SoloLearningGame(BaseNNGame):
             model = torch.load(model_path)
         else:
             model = None
-        self.total_games_played = 0  # reset game counter
-        self.baseline = self.prior_baseline_score
+        self.baseline = self.rl_params["prior_baseline_score"]
         self.step_id = 0  # step id for TensorBoard
 
         if self.player_type == "mlp":
@@ -137,25 +145,66 @@ class SoloLearningGame(BaseNNGame):
         """Save the player (model + config) to a file."""
         self.players[0].dump(player_path)
 
+    def run_eval_vs_random(self) -> tuple[float, float]:
+        """Run evaluation against random players using the shared TensorBoard writer."""
+        n_random_players = self.eval_vs_random_config.get("n_players", 1)
+
+        if self.verbose > 0:
+            logger.info(f"Running eval vs {n_random_players} random player(s)...")
+        win_rate, mean_score = play_vs_random(
+            player=self.players[0],
+            n_random_players=n_random_players,
+            n_eval_batches=self.eval_vs_random_config.get("n_batches", 100),
+            batch_size=self.eval_vs_random_config.get("batch_size", 32),
+            writer=self.writer,  # Share the TensorBoard writer
+            verbose=0,  # Quiet mode for intermediate evals
+        )
+        if self.verbose > 0:
+            logger.info(f"Eval vs random: win_rate={win_rate:.2%}, mean_score={mean_score:.2f}")
+        return win_rate, mean_score
+
+    def run_eval_solo(self) -> float:
+        """Run solo evaluation and log to TensorBoard."""
+        n_batches = self.eval_solo_config.get("n_batches", 100)
+        batch_size = self.eval_solo_config.get("batch_size", 32)
+
+        if self.verbose > 0:
+            logger.info(f"Running solo eval ({n_batches} batches x {batch_size})...")
+
+        scores = self.play_games_batches(n_batches=n_batches, batch_size=batch_size)
+        mean_score = scores.mean().item()
+
+        if self.writer is not None:
+            step = self.players[0].n_training_games_played
+            self.writer.add_scalar("eval/solo/mean_score", mean_score, step)
+            self.writer.add_scalar("eval/solo/max_score", scores.max().item(), step)
+            self.writer.add_scalar("eval/solo/min_score", scores.min().item(), step)
+            self.writer.add_scalar("eval/solo/std_score", scores.std().item(), step)
+            self.writer.flush()
+
+        if self.verbose > 0:
+            logger.info(f"Eval solo: mean_score={mean_score:.2f}")
+
+        return float(mean_score)
+
     def log_hparams(self, extra_hparams: dict[str, Any] | None = None) -> None:
         """Log hyperparameters to TensorBoard for experiment comparison."""
         hparams = {
             "n_rounds": self.n_rounds,
             "draft_size": self.draft_size,
-            "prior_baseline_score": self.prior_baseline_score,
+            "rl_params": self.rl_params,
+            "model_params": self.model_params,
+            "player_params": self.player_params,
+            "optimizer_params": self.optimizer_params,
             "use_bonus_cards": self.use_bonus_cards,
             "replace_remaining_cards": self.replace_remaining_cards,
-            # "hidden_layers_sizes": self.hidden_layers_sizes,
-            "dropout_rate": self.model_params["dropout_rate"],
-            "use_cards_hand_in_state": self.player_params["use_cards_hand_in_state"],
-            "use_draft_indicator_in_model_input": self.player_params[
-                "use_draft_indicator_in_model_input"
-            ],
         }
         if extra_hparams:
             hparams.update(extra_hparams)
         if self.writer is not None:
-            self.writer.add_hparams(hparams, {})
+            # Use add_text instead of add_hparams to avoid creating timestamp subdirectories
+            hparams_text = "\n".join(f"**{k}**: {v}" for k, v in hparams.items())
+            self.writer.add_text("hparams", hparams_text, 0)
 
     def _play_card(self, type: str) -> torch.Tensor:
         batch_size = self.players[0].get_current_batch_size()
@@ -217,11 +266,13 @@ class SoloLearningGame(BaseNNGame):
         self.round_index += 1
         return picked_probabilities
 
-    def learning_step(self, batch_size: int = 32) -> None:
+    def learning_step(self) -> None:
         # empty probas tensor for training. dim 0 is batch, but no values
-        self.picked_probabilities = torch.ones(batch_size, 0, device=self.device)
+        self.picked_probabilities = torch.ones(
+            self.rl_params["train_batch_size"], 0, device=self.device
+        )
         # play the game and get the log probabilities
-        self.play_games_batch(batch_size, learning_mode=True)
+        self.play_games_batch(self.rl_params["train_batch_size"], learning_mode=True)
         log_probs = torch.log(self.picked_probabilities)  # (batch, n_rounds)
         # apply final_count_from_tensor_field for each element of the batch
         scores = self.get_scores()[:, 0]
@@ -233,30 +284,31 @@ class SoloLearningGame(BaseNNGame):
         self.optimizer.step()
 
         # Update total games played (epoch metric based on environment interactions)
-        self.total_games_played += batch_size
+        self.players[0].n_training_games_played += self.rl_params["train_batch_size"]
+        n_training_games_played = self.players[0].n_training_games_played
 
         # Log metrics to TensorBoard
-        # Using total_games_played as x-axis for fair comparison across batch sizes
+        # Using n_training_games_played as x-axis for fair comparison across batch sizes
         if self.writer is not None:
             self.writer.add_scalar(
-                "solo_train_score/mean", scores.mean().item(), self.total_games_played
+                "solo_train_score/mean", scores.mean().item(), n_training_games_played
             )
             self.writer.add_scalar(
-                "solo_train_score/max", scores.max().item(), self.total_games_played
+                "solo_train_score/max", scores.max().item(), n_training_games_played
             )
             self.writer.add_scalar(
-                "solo_train_score/min", scores.min().item(), self.total_games_played
+                "solo_train_score/min", scores.min().item(), n_training_games_played
             )
             self.writer.add_scalar(
-                "solo_train_score/std", scores.std().item(), self.total_games_played
+                "solo_train_score/std", scores.std().item(), n_training_games_played
             )
-            self.writer.add_scalar("baseline/value", self.baseline, self.total_games_played)
+            self.writer.add_scalar("baseline/value", self.baseline, n_training_games_played)
             self.writer.add_scalar(
-                "advantage/mean", advantage.mean().item(), self.total_games_played
+                "advantage/mean", advantage.mean().item(), n_training_games_played
             )
-            self.writer.add_scalar("advantage/std", advantage.std().item(), self.total_games_played)
-            self.writer.add_scalar("loss/policy", loss.item(), self.total_games_played)
-            self.writer.add_scalar("step_id", self.step_id, self.total_games_played)
+            self.writer.add_scalar("advantage/std", advantage.std().item(), n_training_games_played)
+            self.writer.add_scalar("loss/policy", loss.item(), n_training_games_played)
+            self.writer.add_scalar("step_id", self.step_id, n_training_games_played)
 
         if self.verbose > 0:
             logger.info(
@@ -264,13 +316,26 @@ class SoloLearningGame(BaseNNGame):
                 f"Score: {scores.mean().item():.2f}. "
                 f"Baseline: {self.baseline:.2f}. "
                 f"Loss: {loss.item():.2f}. "
-                f"Games: {self.total_games_played}"
+                f"Games: {n_training_games_played}"
             )
         # update the baseline
         self.baseline = (
-            self.baseline + self.update_baseline_rate * (scores.mean() - self.baseline)
+            self.baseline + self.rl_params["update_baseline_rate"] * (scores.mean() - self.baseline)
         ).item()
         self.step_id += 1
+
+        # Run periodic evaluations
+        if self.eval_vs_random_config and (
+            self.step_id % self.eval_vs_random_config.get("every", 500) == 0
+            or (self.step_id == 1 and self.eval_vs_random_config.get("initial_eval", False))
+        ):
+            self.run_eval_vs_random()
+
+        if self.eval_solo_config and (
+            self.step_id % self.eval_solo_config.get("every", 500) == 0
+            or (self.step_id == 1 and self.eval_solo_config.get("initial_eval", False))
+        ):
+            self.run_eval_solo()
 
 
 def main(
@@ -282,6 +347,15 @@ def main(
     draft_size: Annotated[int, typer.Option(help="Draft size")] = 10,
     n_steps: Annotated[int, typer.Option(help="Number of training steps")] = 1000,
     n_eval_batches: Annotated[int, typer.Option(help="Number of evaluation batches")] = 100,
+    eval_vs_random_every: Annotated[
+        int | None, typer.Option(help="Run eval vs random every N steps (None to disable)")
+    ] = None,
+    eval_vs_random_n_players: Annotated[
+        int, typer.Option(help="Number of random players for eval")
+    ] = 1,
+    eval_solo_every: Annotated[
+        int | None, typer.Option(help="Run eval solo every N steps (None to disable)")
+    ] = None,
 ) -> None:
     """Run a solo learning game."""
     logger.remove()  # remove default stderr handler
@@ -290,9 +364,27 @@ def main(
     else:
         logger.add(sys.stdout)
 
+    eval_vs_random_config: dict[str, Any] | None = None
+    if eval_vs_random_every is not None:
+        eval_vs_random_config = {
+            "every": eval_vs_random_every,
+            "n_players": eval_vs_random_n_players,
+            "n_batches": n_eval_batches,
+            "batch_size": batch_size,
+            "initial_eval": True,
+        }
+
+    eval_solo_config: dict[str, Any] | None = None
+    if eval_solo_every is not None:
+        eval_solo_config = {
+            "every": eval_solo_every,
+            "n_batches": n_eval_batches,
+            "batch_size": batch_size,
+            "initial_eval": True,
+        }
+
     game = SoloLearningGame(
         verbose=2,
-        prior_baseline_score=29,
         experiment_name=experiment_name,
         model_params={
             "hidden_layers_sizes": [512, 512],
@@ -303,34 +395,24 @@ def main(
             "use_draft_indicator_in_model_input": False,
         },
         optimizer_params={
-            "lr": 0.001,
+            "lr": 0.0005,
+        },
+        rl_params={
+            "prior_baseline_score": 29,
+            "train_batch_size": 32,
+            "update_baseline_rate": 0.05,
         },
         draft_size=draft_size,
+        eval_vs_random_config=eval_vs_random_config,
+        eval_solo_config=eval_solo_config,
     )
 
     # Log hyperparameters for experiment comparison
-    game.log_hparams({"n_steps": n_steps, "batch_size": batch_size, **game.optimizer_params})
-
-    # Initial evaluation
-    initial_scores = game.play_games_batches(n_batches=n_eval_batches, batch_size=batch_size)
-    logger.info(
-        f"Initial score: {initial_scores.mean().item():.2f}. Best: {initial_scores.max().item()}"
-    )
+    game.log_hparams({"n_steps": n_steps})
 
     # Training
     for _ in range(n_steps):
-        game.learning_step(batch_size=batch_size)
-
-    # Final evaluation
-    final_scores = game.play_games_batches(n_batches=n_eval_batches, batch_size=batch_size)
-    logger.info(f"Final score: {final_scores.mean().item():.2f}. Best: {final_scores.max().item()}")
-
-    # Log final metrics
-    if game.writer is not None:
-        game.writer.add_scalar("eval/solo_score", initial_scores.mean().item(), 0)
-        game.writer.add_scalar(
-            "eval/solo_score", final_scores.mean().item(), game.total_games_played
-        )
+        game.learning_step()
 
     game.dump_player(f"runs/{game.experiment_name}/player.pt")
     game.close_tensorboard()

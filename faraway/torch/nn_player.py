@@ -25,6 +25,8 @@ class BaseNNPlayer(BasePlayer):
 
         self.model_params = model_params or {}
 
+        self.n_training_games_played = 0
+
     def set_model(self, model: nn.Module | None) -> None:
         if model is None:
             self.reset_model()

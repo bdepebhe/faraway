@@ -122,6 +122,7 @@ class MLPPlayer(BaseNNPlayer):
                 "n_cards_hand": self.n_cards_hand,
                 "use_draft_indicator_in_model_input": self.use_draft_indicator_in_model_input,
             },
+            "n_training_games_played": self.n_training_games_played,
         }
         torch.save(checkpoint, path)
 
@@ -143,5 +144,5 @@ class MLPPlayer(BaseNNPlayer):
 
         # Load the model weights
         player.model.load_state_dict(checkpoint["model_state_dict"])
-
+        player.n_training_games_played = checkpoint["n_training_games_played"]
         return player

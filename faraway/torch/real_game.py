@@ -3,6 +3,7 @@ Real batched games using nn bots.
 """
 
 import sys
+from collections.abc import Sequence
 from typing import Annotated
 
 import torch
@@ -21,7 +22,7 @@ MAP_INDEX_IN_FLATTENED_CARD = MainCard.get_field_index("map", "assets")
 class RealNNGame(BaseNNGame):
     def __init__(
         self,
-        players: list[BasePlayer],
+        players: Sequence[BasePlayer],
         n_rounds: int = 8,
         use_bonus_cards: bool = True,
         device: torch.device | None = None,

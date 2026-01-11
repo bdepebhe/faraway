@@ -87,7 +87,7 @@ class BaseNNGame(ABC):
         n_rounds: int = 8,
         use_bonus_cards: bool = True,
         device: torch.device | None = None,
-        players: list[BasePlayer] | None = None,
+        players: Sequence[BasePlayer] | None = None,
         verbose: int = 0,
         experiment_name: str | None = None,
         log_dir: str = "runs",
@@ -135,51 +135,6 @@ class BaseNNGame(ABC):
         if self.writer is not None:
             self.writer.close()
             self.writer = None
-
-    def log_evaluation_scores(
-        self,
-        scores: torch.Tensor,
-        player_names: list[str] | None = None,
-        step: int | None = None,
-    ) -> None:
-        """
-        Log evaluation scores to TensorBoard.
-
-        Args:
-            scores: Tensor of shape (n_games, n_players) with scores
-            player_names: Optional list of player names for labeling
-            step: Optional step number (defaults to total_games_played)
-        """
-        if self.writer is None:
-            return
-
-        if step is None:
-            step = self.total_games_played
-
-        n_players = scores.shape[1]
-        if player_names is None:
-            player_names = [f"player_{i}" for i in range(n_players)]
-
-        # Per-player stats
-        for i, name in enumerate(player_names):
-            player_scores = scores[:, i]
-            self.writer.add_scalar(f"eval/{name}/mean_score", player_scores.mean().item(), step)
-            self.writer.add_scalar(f"eval/{name}/max_score", player_scores.max().item(), step)
-            self.writer.add_scalar(f"eval/{name}/min_score", player_scores.min().item(), step)
-            self.writer.add_scalar(f"eval/{name}/std_score", player_scores.std().item(), step)
-            self.writer.add_histogram(f"eval/{name}/score_dist", player_scores, step)
-
-        # Win stats
-        winners = scores.argmax(dim=1)
-        for i, name in enumerate(player_names):
-            wins = (winners == i).sum().item()
-            win_rate = wins / scores.shape[0] * 100
-            self.writer.add_scalar(f"eval/{name}/wins", wins, step)
-            self.writer.add_scalar(f"eval/{name}/win_rate", win_rate, step)
-
-        # Overall stats
-        self.writer.add_scalar("eval/overall_mean_score", scores.mean().item(), step)
-        self.writer.add_scalar("eval/overall_max_score", scores.max().item(), step)
 
     @abstractmethod
     def play_round(self) -> torch.Tensor:
@@ -281,8 +236,5 @@ class BaseNNGame(ABC):
                 f"Wins: {wins}\n"
                 f"Win rate: {win_rate}%\n"
             )
-
-        # Log to TensorBoard if writer is initialized
-        self.log_evaluation_scores(scores, player_names=player_names)
 
         return wins, mean_scores
