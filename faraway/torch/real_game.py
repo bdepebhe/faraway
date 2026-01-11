@@ -3,6 +3,7 @@ Real batched games using nn bots.
 """
 
 import sys
+from collections.abc import Sequence
 from typing import Annotated
 
 import torch
@@ -13,7 +14,7 @@ from faraway.core.base_player import BasePlayer
 from faraway.core.data_structures import MainCard, MainCardsSeries
 from faraway.core.human_player import HumanPlayer
 from faraway.torch.base_game import BaseNNGame
-from faraway.torch.nn_player import NNPlayer
+from faraway.torch.nn_player import BaseNNPlayer
 
 MAP_INDEX_IN_FLATTENED_CARD = MainCard.get_field_index("map", "assets")
 
@@ -21,13 +22,17 @@ MAP_INDEX_IN_FLATTENED_CARD = MainCard.get_field_index("map", "assets")
 class RealNNGame(BaseNNGame):
     def __init__(
         self,
-        players: list[BasePlayer],
+        players: Sequence[BasePlayer],
         n_rounds: int = 8,
         use_bonus_cards: bool = True,
         device: torch.device | None = None,
         verbose: int = 0,
+        experiment_name: str | None = None,
+        log_dir: str = "runs",
     ):
-        super().__init__(n_rounds, use_bonus_cards, device, players, verbose)
+        super().__init__(
+            n_rounds, use_bonus_cards, device, players, verbose, experiment_name, log_dir
+        )
         self.verbose = verbose
         self.draft_pool: torch.Tensor | None = None
 
@@ -190,7 +195,7 @@ class RealNNGame(BaseNNGame):
 
     def resolve_actions_one_player(
         self,
-        player: NNPlayer,
+        player: BaseNNPlayer,
         draft_pool: torch.Tensor,
         index_played_from_hand: int,
         n_bonus_cards_to_draw: int,
@@ -294,29 +299,6 @@ class RealNNGame(BaseNNGame):
                     )
         return draft_pool
 
-    def run_tournament(self, n_batches: int, batch_size: int) -> tuple[list[int], list[float]]:
-        scores = self.play_games_batches(  # (n_batches * batch_size, n_players)
-            n_batches,
-            batch_size,
-        )
-        winner = scores.argmax(dim=1)
-        # count the number of occurence of each player id in the winner tensor
-        wins = []
-        win_rate = []
-        for player_id in range(len(self.players)):
-            wins.append(torch.where(winner == player_id)[0].shape[0])
-            win_rate.append(wins[-1] / (n_batches * batch_size) * 100)
-        # average scores for each player
-        mean_scores = scores.mean(dim=0).tolist()
-        if self.verbose > 0:
-            logger.info(
-                f"Tournament completed.\n"
-                f"Mean scores: {mean_scores}\n"
-                f"Wins: {wins}\n"
-                f"Win rate: {win_rate}%\n"
-            )
-        return wins, mean_scores
-
 
 def main(
     players: Annotated[
@@ -327,22 +309,30 @@ def main(
     batch_size: Annotated[int, typer.Option(help="Training batch size")] = 32,
     n_batches: Annotated[int, typer.Option(help="Number of batches to play")] = 100,
     verbose: Annotated[int, typer.Option(help="Verbosity level")] = 1,
+    experiment_name: Annotated[
+        str | None, typer.Option(help="Name for TensorBoard experiment (enables logging)")
+    ] = None,
+    log_dir: Annotated[str, typer.Option(help="Directory for TensorBoard logs")] = "runs",
 ) -> None:
     """Run a tournament between NN players."""
     logger.remove()  # remove default stderr handler
     if log_to_file:
-        logger.add("faraway.log")
+        logger.add(f"{log_dir}/{experiment_name}/real_game.log")
     else:
         logger.add(sys.stdout)
     n_rounds = 8
 
     # load the players
     players_list: list[BasePlayer] = []
+    player_names: list[str] = []
     for player in players or []:
         if player.endswith(".pt"):
-            players_list.append(NNPlayer.load(player))
+            players_list.append(BaseNNPlayer.load(player))
+            # Extract a short name from the path for TensorBoard labels
+            player_names.append(player.replace("/", "_").replace(".pt", ""))
         elif player == "human":
             players_list.append(HumanPlayer(n_rounds))
+            player_names.append("human")
         else:
             raise ValueError(f"Unknown player type: {player}")
         if players_list[-1].n_rounds != n_rounds:
@@ -354,8 +344,29 @@ def main(
         players=players_list,
         n_rounds=n_rounds,
         verbose=verbose,
+        experiment_name=experiment_name,
+        log_dir=log_dir,
     )
-    game.run_tournament(n_batches=n_batches, batch_size=batch_size)
+    logger.info(f"Starting real games tournament with {len(players_list)} players")
+    logger.info(f"Players: {player_names}")
+    logger.info(f"Batch size: {batch_size}")
+    logger.info(f"Number of batches: {n_batches}")
+    logger.info(f"Verbose: {verbose}")
+    logger.info(f"Experiment name: {experiment_name}")
+    logger.info(f"Log directory: {log_dir}")
+
+    # Initialize TensorBoard if experiment name is provided
+    if experiment_name is not None:
+        game.init_tensorboard(default_prefix="eval")
+        logger.info(f"TensorBoard logging enabled: {log_dir}/{game.experiment_name}")
+
+    game.run_tournament(n_batches=n_batches, batch_size=batch_size, player_names=player_names)
+
+    # Close TensorBoard writer
+    if game.writer is not None:
+        game.close_tensorboard()
+        logger.info(f"TensorBoard logs saved to: {log_dir}/{game.experiment_name}")
+        logger.info("Run 'tensorboard --logdir=runs' to view results")
 
 
 if __name__ == "__main__":

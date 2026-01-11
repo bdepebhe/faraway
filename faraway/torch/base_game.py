@@ -2,9 +2,11 @@
 
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
+from datetime import datetime
 
 import torch
 from loguru import logger
+from torch.utils.tensorboard import SummaryWriter
 
 from faraway.core.base_player import BasePlayer
 from faraway.core.data_structures import BonusCard, MainCard
@@ -85,8 +87,10 @@ class BaseNNGame(ABC):
         n_rounds: int = 8,
         use_bonus_cards: bool = True,
         device: torch.device | None = None,
-        players: list[BasePlayer] | None = None,
+        players: Sequence[BasePlayer] | None = None,
         verbose: int = 0,
+        experiment_name: str | None = None,
+        log_dir: str = "runs",
     ):
         self.n_rounds = n_rounds
         self.use_bonus_cards = use_bonus_cards
@@ -102,6 +106,35 @@ class BaseNNGame(ABC):
         self.players: Sequence[BasePlayer] = players or []
         # check that the players have the same number of rounds
         self.verbose = verbose
+
+        # TensorBoard logging (optional)
+        self.writer: SummaryWriter | None = None
+        self.experiment_name = experiment_name
+        self.log_dir = log_dir
+        self.total_games_played = 0
+
+    def init_tensorboard(
+        self, experiment_name: str | None = None, default_prefix: str = "faraway"
+    ) -> None:
+        """Initialize TensorBoard writer for logging.
+
+        Args:
+            experiment_name: Name for the experiment. If None/empty, uses self.experiment_name
+                or generates a timestamped name.
+            default_prefix: Prefix for auto-generated experiment names.
+        """
+        if not experiment_name:
+            experiment_name = self.experiment_name
+        if not experiment_name:
+            experiment_name = f"{default_prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        self.experiment_name = experiment_name
+        self.writer = SummaryWriter(log_dir=f"{self.log_dir}/{experiment_name}")
+
+    def close_tensorboard(self) -> None:
+        """Close the TensorBoard writer."""
+        if self.writer is not None:
+            self.writer.close()
+            self.writer = None
 
     @abstractmethod
     def play_round(self) -> torch.Tensor:
@@ -168,3 +201,40 @@ class BaseNNGame(ABC):
             batches_scores.append(self.get_scores())
         scores = torch.cat(batches_scores, dim=0)  # (n_batches * batch_size, players)
         return scores
+
+    def run_tournament(
+        self,
+        n_batches: int,
+        batch_size: int,
+        player_names: list[str] | None = None,
+    ) -> tuple[list[int], list[float]]:
+        """Run a tournament and return wins and mean scores per player.
+
+        Args:
+            n_batches: Number of batches to play
+            batch_size: Number of games per batch
+            player_names: Optional names for TensorBoard logging
+
+        Returns:
+            Tuple of (wins per player, mean scores per player)
+        """
+        scores = self.play_games_batches(n_batches, batch_size)
+        self.total_games_played += n_batches * batch_size
+
+        winner = scores.argmax(dim=1)
+        wins = []
+        win_rate = []
+        for player_id in range(len(self.players)):
+            wins.append(torch.where(winner == player_id)[0].shape[0])
+            win_rate.append(wins[-1] / (n_batches * batch_size) * 100)
+
+        mean_scores = scores.mean(dim=0).tolist()
+        if self.verbose > 0:
+            logger.info(
+                f"Tournament completed.\n"
+                f"Mean scores: {mean_scores}\n"
+                f"Wins: {wins}\n"
+                f"Win rate: {win_rate}%\n"
+            )
+
+        return wins, mean_scores
