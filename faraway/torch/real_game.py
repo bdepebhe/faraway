@@ -39,21 +39,8 @@ class RealNNGame(BaseNNGame):
     def reset_games_batch(self, batch_size: int) -> None:
         # reset the deck and the fields
         super().reset_games_batch(batch_size)
-        # expand the main deck to batch size: (68, 24) -> (batch_size, 68, 24)
-        expanded_main_deck = self.decks["main"].unsqueeze(0).expand(batch_size, -1, -1)
-        card_length = self.decks["main"].shape[1]
-        # give 3 main cards to each player
-        for player in self.players:
-            # draw 3 main cards - indices shape: (batch_size, 3) with values 0-67
-            indices = torch.multinomial(
-                self.deck_availability["main"].float(), 3, replacement=False
-            )
-            # expand indices for gather: (batch_size, 3) -> (batch_size, 3, 24)
-            indices_expanded = indices.unsqueeze(2).expand(-1, -1, card_length)
-            # gather cards: (batch_size, 68, 24) -> (batch_size, 3, 24)
-            player.cards_hand = torch.gather(expanded_main_deck, 1, indices_expanded)
-            # update the deck availability
-            self.deck_availability["main"].scatter_(1, indices, False)
+        # deal initial hands to all players (3 cards each)
+        self.deal_initial_hands(n_cards=3, batch_size=batch_size)
         if self.verbose > 98:
             logger.debug(f"BATCH SETUP: batch_size={batch_size}")
             for i in range(batch_size):
@@ -241,12 +228,20 @@ class RealNNGame(BaseNNGame):
                 player.fields["main"][game_id, self.round_index, 0]
                 > player.fields["main"][game_id, self.round_index - 1, 0]
             ):
-                # cap to available bonus cards
+                # Check if we need to reshuffle discarded bonus cards
+                # Per official rules: "If the Sanctuary deck is empty, shuffle the
+                # discarded Sanctuary cards to form a new deck."
+                self.reshuffle_bonus_discard_if_needed(
+                    game_ids=torch.tensor([game_id], device=self.device),
+                    n_cards_needed=n_bonus_cards_to_draw,
+                )
+
+                # cap to available bonus cards (after potential reshuffle)
                 n_available = self.deck_availability["bonus"][game_id, :].sum().item()
                 if n_bonus_cards_to_draw > n_available:
                     raise ValueError(
                         f"Player {player} can't draw {n_bonus_cards_to_draw} "
-                        f"bonus cards, only {n_available} available"
+                        f"bonus cards, only {n_available} available (even after reshuffle)"
                     )
 
                 indices = torch.multinomial(
@@ -276,6 +271,19 @@ class RealNNGame(BaseNNGame):
                 player.fields["bonus"][game_id : game_id + 1, self.round_index - 1, :] = (
                     selected_card
                 )
+
+                # Track discarded bonus cards (drawn but not chosen) for reshuffling
+                # The selected card stays "used", the others go to the discard pile
+                selected_index = int(index.squeeze()) if hasattr(index, "squeeze") else int(index)
+                discarded_indices = indices.squeeze(0).clone()
+                # Create mask to exclude selected card
+                mask = (
+                    torch.arange(discarded_indices.shape[0], device=self.device) != selected_index
+                )
+                discarded_indices = discarded_indices[mask]  # All indices except the selected one
+                # Add discarded cards to the discard pile
+                if discarded_indices.numel() > 0:
+                    self.bonus_discard[game_id, discarded_indices] = True
                 if self.verbose > 98:
                     logger.debug(f"    Player draws {n_bonus_cards_to_draw} bonus cards")
                     logger.debug(

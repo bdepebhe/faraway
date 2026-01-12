@@ -151,9 +151,50 @@ class BaseNNGame(ABC):
             "main": main_deck_availability,
             "bonus": bonus_deck_availability,
         }
+        # Track discarded bonus cards (drawn but not chosen) for reshuffling
+        # Per official rules: when deck is empty, shuffle discarded cards to form new deck
+        self.bonus_discard = torch.zeros(
+            batch_size, self.decks["bonus"].shape[0], dtype=torch.bool, device=self.device
+        )  # (batch, n_total_bonus_cards) - True means card is in discard pile
         for player in self.players:
             player.reset_games_batch(batch_size)
         self.round_index = 0
+
+    def deal_initial_hands(
+        self,
+        players: Sequence[BasePlayer] | None = None,
+        n_cards: int = 3,
+        batch_size: int | None = None,
+    ) -> None:
+        """Deal initial hands to players from the main deck.
+
+        Args:
+            players: List of players to deal hands to. Defaults to self.players.
+            n_cards: Number of cards per hand. Defaults to 3.
+            batch_size: Batch size. If None, inferred from deck availability.
+        """
+        if players is None:
+            players = self.players
+        if batch_size is None:
+            batch_size = self.deck_availability["main"].shape[0]
+
+        card_length = self.decks["main"].shape[1]
+        expanded_main_deck = self.decks["main"].unsqueeze(0).expand(batch_size, -1, -1)
+
+        for player in players:
+            # Draw n_cards from the deck
+            indices = torch.multinomial(
+                self.deck_availability["main"].float(), n_cards, replacement=False
+            )  # (batch, n_cards)
+
+            # Expand indices for gather: (batch, n_cards) -> (batch, n_cards, card_length)
+            indices_expanded = indices.unsqueeze(2).expand(-1, -1, card_length)
+
+            # Gather cards: (batch, deck_size, card_length) -> (batch, n_cards, card_length)
+            player.cards_hand = torch.gather(expanded_main_deck, 1, indices_expanded)
+
+            # Mark these cards as unavailable in the deck
+            self.deck_availability["main"].scatter_(1, indices, False)
 
     def get_used_cards_ids(self, type: str, game_id: int) -> list[int]:
         used_cards_ids = [
@@ -161,6 +202,40 @@ class BaseNNGame(ABC):
             for card_id in torch.where(~self.deck_availability[type][game_id])[0].tolist()
         ]
         return used_cards_ids
+
+    def reshuffle_bonus_discard_if_needed(
+        self, game_ids: torch.Tensor | None = None, n_cards_needed: int = 1
+    ) -> None:
+        """Reshuffle discarded bonus cards back into the deck when needed.
+
+        Per official rules: "If the Sanctuary deck is empty, shuffle the discarded
+        Sanctuary cards (those not chosen by players) to form a new deck."
+
+        Args:
+            game_ids: Tensor of game indices to check/reshuffle (None = all games)
+            n_cards_needed: Number of cards needed for the draw
+        """
+        if game_ids is None:
+            game_ids = torch.arange(self.deck_availability["bonus"].shape[0], device=self.device)
+
+        # For each game, check if we need to reshuffle
+        for game_id in game_ids:
+            gid = int(game_id.item()) if isinstance(game_id, torch.Tensor) else game_id
+            n_available = self.deck_availability["bonus"][gid].sum().item()
+
+            if n_available < n_cards_needed:
+                # Reshuffle: move discarded cards back to available
+                n_discarded = self.bonus_discard[gid].sum().item()
+                if n_discarded > 0:
+                    if self.verbose > 1:
+                        logger.debug(
+                            f"Game #{gid}: Reshuffling {int(n_discarded)} discarded bonus cards "
+                            f"(had {int(n_available)} available, need {n_cards_needed})"
+                        )
+                    # Move discarded cards back to available
+                    self.deck_availability["bonus"][gid] |= self.bonus_discard[gid]
+                    # Clear the discard pile
+                    self.bonus_discard[gid] = False
 
     def get_scores(self) -> torch.Tensor:
         return torch.stack(
