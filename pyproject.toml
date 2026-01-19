@@ -46,6 +46,7 @@ select = [
 python_version = "3.10"
 strict = true
 plugins = ["pydantic.mypy"]
+explicit_package_bases = true
 
 [[tool.mypy.overrides]]
 module = "data.*"

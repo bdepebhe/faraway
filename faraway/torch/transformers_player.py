@@ -32,7 +32,6 @@ class TransformersPlayer(BaseNNPlayer):
         model_params: dict[str, Any] | None = None,
         n_cards_hand: int = 3,
         use_bonus_cards: bool = True,
-        use_cards_hand_in_state: bool = False,
         use_mode_embedding: bool = False,
     ):
         super().__init__(
@@ -42,7 +41,6 @@ class TransformersPlayer(BaseNNPlayer):
             model_params,
             n_cards_hand,
             use_bonus_cards,
-            use_cards_hand_in_state,
         )
 
         self.use_mode_embedding = use_mode_embedding
@@ -75,6 +73,7 @@ class TransformersPlayer(BaseNNPlayer):
         round_index: int,
         mode: str = "play",
         games_indices: slice | range | None = None,
+        return_logits: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Evaluate possible cards and select one using the Transformer model.
 
@@ -84,9 +83,10 @@ class TransformersPlayer(BaseNNPlayer):
             mode: "play", "draft", or "bonus" - affects model behavior via mode embedding
             games_indices: Optional slice or indices to select specific batch elements from fields.
                            If None, uses all batch elements.
+            return_logits: If True, return logits instead of probabilities as first element
 
         Returns:
-            probabilities: (batch, n_cards) - probability distribution over candidates
+            probabilities_or_logits: (batch, n_cards) - probability distribution or raw logits
             index: (batch, 1) - index of selected card
             selected_cards: (batch, card_length) - the selected card tensors
         """
@@ -128,7 +128,7 @@ class TransformersPlayer(BaseNNPlayer):
         # Store for potential hand management
         self.cards_hand_index_to_replace = index
 
-        return probabilities, index, selected_cards
+        return (logits if return_logits else probabilities), index, selected_cards
 
     def dump(self, path: str) -> None:
         """Save the player (model + config) to a single file."""
@@ -138,7 +138,6 @@ class TransformersPlayer(BaseNNPlayer):
             "config": {
                 "n_rounds": self.n_rounds,
                 "use_bonus_cards": self.use_bonus_cards,
-                "use_cards_hand_in_state": self.use_cards_hand_in_state,
                 "n_cards_hand": self.n_cards_hand,
                 "use_mode_embedding": self.use_mode_embedding,
             },

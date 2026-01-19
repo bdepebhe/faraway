@@ -27,8 +27,8 @@ class MLPPlayer(BaseNNPlayer):
             model_params,
             n_cards_hand,
             use_bonus_cards,
-            use_cards_hand_in_state,
         )
+        self.use_cards_hand_in_state = use_cards_hand_in_state
 
         self.state_length = (
             MainCard.length() * (self.n_rounds + self.n_bonus_cards)  # previous cards
@@ -60,6 +60,7 @@ class MLPPlayer(BaseNNPlayer):
         round_index: int,
         mode: str = "play",
         games_indices: slice | range | None = None,
+        return_logits: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Evaluate possible cards and select one.
 
@@ -69,6 +70,7 @@ class MLPPlayer(BaseNNPlayer):
             mode: "play", "draft", or "bonus"
             games_indices: Optional slice or indices to select specific batch elements from fields.
                            If None, uses all batch elements. Use slice(i, i+1) for single element.
+            return_logits: If True, return logits instead of probabilities as first element
         """
         if games_indices is None:
             games_indices = slice(None)
@@ -108,7 +110,7 @@ class MLPPlayer(BaseNNPlayer):
             1
         )  # (batch, card_length)
         self.cards_hand_index_to_replace = index
-        return probabilities, index, selected_cards
+        return (logits if return_logits else probabilities), index, selected_cards
 
     def dump(self, path: str) -> None:
         """Save the player (model + config) to a single file."""

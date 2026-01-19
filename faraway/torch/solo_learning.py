@@ -36,10 +36,36 @@ def sample_cards_from_availability_tensor(
 
 class SoloLearningGame(BaseNNGame):
     """
-    Batched solo play game using tensors.
+    Batched solo play game using tensors for REINFORCE-based training.
+
+    Supports two advantage computation modes:
+        - Baseline-based (default): advantage = reward - EMA_baseline
+        - Peer-relative: advantage = (reward - batch_mean) / batch_std (z-score)
+          or advantage = reward - batch_mean (center)
+
+    Peer-relative reward mode (rl_params["peer_relative_reward"] = True):
+        Games in a sub-batch see the exact same cards in the same order (fixed seed).
+        This enables fair comparison: score differences are purely due to model decisions.
+        Advantage is computed within each sub-batch (z-score or centering).
+        Requires appropriate deck/draft sizes to avoid deck exhaustion (e.g., hand=3, draft=3).
+
+        Sub-batches (rl_params["peer_sub_batch_size"]):
+            The training batch can be divided into sub-batches. Each sub-batch gets a
+            different deck shuffle, but games within the same sub-batch see identical cards.
+            Example: batch_size=128, peer_sub_batch_size=32 → 4 sub-batches with different
+            deck shuffles, advantage normalized within each 32-game sub-batch.
+            If peer_sub_batch_size is None, the entire batch is one sub-batch.
+
+        In this mode, prior_baseline_score and update_baseline_rate are NOT used for
+        training (advantage comes from sub-batch mean), but the baseline EMA is still
+        tracked for TensorBoard monitoring.
 
     Attributes:
         n_rounds: Number of rounds in the game
+        draft_size: Number of cards shown in each draft
+        peer_relative_reward: If True, use fixed seed and within-sub-batch advantage
+        peer_sub_batch_size: Size of sub-batches for peer comparison (None = full batch)
+        advantage_peer_normalization: "zscore" or "center" (only used if peer_relative_reward)
         device: Torch device for tensors
 
     Tensor shapes:
@@ -64,7 +90,7 @@ class SoloLearningGame(BaseNNGame):
         draft_size: int = 10,
         replace_remaining_cards: bool = True,
         use_bonus_cards: bool = True,
-        use_draft: bool = False,
+        use_hand: bool = False,
         n_cards_hand: int = 3,
         model_path: str | None = None,
         verbose: int = 1,
@@ -89,7 +115,7 @@ class SoloLearningGame(BaseNNGame):
         )
         self.draft_size = draft_size
         self.replace_remaining_cards = replace_remaining_cards
-        self.use_draft = use_draft
+        self.use_hand = use_hand
         self.n_cards_hand = n_cards_hand
         self.model_params = model_params or {
             "hidden_layers_sizes": [512, 512],
@@ -108,6 +134,14 @@ class SoloLearningGame(BaseNNGame):
             "train_batch_size": 32,
             "update_baseline_rate": 0.05,
         }
+        # Peer-relative reward settings
+        self.peer_relative_reward = self.rl_params.get("peer_relative_reward", False)
+        self.advantage_peer_normalization = self.rl_params.get(
+            "advantage_peer_normalization", "zscore"
+        )  # "zscore" or "center"
+        # Sub-batch size for peer comparison (games within a sub-batch share the same deck shuffle)
+        # If None or 0, the entire batch is one sub-batch (all games see same cards)
+        self.peer_sub_batch_size = self.rl_params.get("peer_sub_batch_size", None)
         self.player_params["use_bonus_cards"] = self.use_bonus_cards
 
         # Evaluation config
@@ -125,7 +159,7 @@ class SoloLearningGame(BaseNNGame):
         else:
             model = None
         self.baseline = self.rl_params["prior_baseline_score"]
-        self.step_id = 0  # step id for TensorBoard
+        self.step_id = 0  # step counter for evaluation frequency (session-local, not saved)
 
         if self.player_type == "mlp":
             self.players = [
@@ -157,9 +191,139 @@ class SoloLearningGame(BaseNNGame):
         """Reset games and initialize player hands if using draft mode."""
         super().reset_games_batch(batch_size)
 
-        if self.use_draft:
-            # Deal initial hand to the solo player
+        if self.peer_relative_reward:
+            # Pre-shuffle decks for peer comparison: games in same sub-batch see same cards
+            self._setup_fixed_seed_decks(batch_size)
+
+            if self.use_hand:
+                # Deal same initial hand to games within each sub-batch
+                self._deal_initial_hands_fixed_seed(
+                    n_cards=self.n_cards_hand, batch_size=batch_size
+                )
+        elif self.use_hand:
+            # Deal random initial hands (legacy behavior)
             self.deal_initial_hands(n_cards=self.n_cards_hand, batch_size=batch_size)
+
+    def _setup_fixed_seed_decks(self, batch_size: int) -> None:
+        """Pre-shuffle decks for peer-relative reward (fixed seed within sub-batches).
+
+        Games within the same sub-batch see the same cards in the same order.
+        Different sub-batches get different deck shuffles for diversity.
+        """
+        # Determine number of sub-batches
+        sub_batch_size = self.peer_sub_batch_size or batch_size
+        self.n_sub_batches = (batch_size + sub_batch_size - 1) // sub_batch_size  # ceil division
+        self.current_sub_batch_size = sub_batch_size
+
+        # Create master deck orderings for each sub-batch
+        self.master_deck_orders = {
+            "main": [
+                torch.randperm(self.decks["main"].shape[0], device=self.device)
+                for _ in range(self.n_sub_batches)
+            ],
+            "bonus": [
+                torch.randperm(self.decks["bonus"].shape[0], device=self.device)
+                for _ in range(self.n_sub_batches)
+            ],
+        }
+        # Track position in the master order for sequential dealing (per sub-batch)
+        self.deck_cursors = {
+            "main": [0] * self.n_sub_batches,
+            "bonus": [0] * self.n_sub_batches,
+        }
+
+    def _compute_peer_relative_advantage(self, shaped_reward: torch.Tensor) -> torch.Tensor:
+        """Compute advantage by normalizing within each sub-batch.
+
+        Games in the same sub-batch faced identical cards, so their scores can be
+        fairly compared. Normalization (z-score or centering) is done per sub-batch.
+
+        Args:
+            shaped_reward: Tensor of shape (batch,) with (shaped) rewards
+
+        Returns:
+            Tensor of shape (batch,) with peer-relative advantages
+        """
+        batch_size = shaped_reward.shape[0]
+
+        # Reshape to (n_sub_batches, sub_batch_size) for vectorized normalization
+        # Pad if batch_size is not evenly divisible
+        padded_size = self.n_sub_batches * self.current_sub_batch_size
+        if batch_size < padded_size:
+            # Pad with zeros (won't affect mean/std of real data)
+            padded_rewards = torch.zeros(padded_size, device=shaped_reward.device)
+            padded_rewards[:batch_size] = shaped_reward
+            reshaped = padded_rewards.view(self.n_sub_batches, self.current_sub_batch_size)
+            # Create mask for valid entries
+            valid_mask = torch.zeros(padded_size, dtype=torch.bool, device=shaped_reward.device)
+            valid_mask[:batch_size] = True
+            valid_mask = valid_mask.view(self.n_sub_batches, self.current_sub_batch_size)
+        else:
+            reshaped = shaped_reward.view(self.n_sub_batches, self.current_sub_batch_size)
+            valid_mask = None
+
+        # Compute mean per sub-batch: (n_sub_batches, 1)
+        if valid_mask is not None:
+            # Handle partial last sub-batch
+            sub_means = (reshaped * valid_mask).sum(dim=1, keepdim=True) / valid_mask.sum(
+                dim=1, keepdim=True
+            ).clamp(min=1)
+        else:
+            sub_means = reshaped.mean(dim=1, keepdim=True)
+
+        if self.advantage_peer_normalization == "zscore":
+            # Compute std per sub-batch
+            centered = reshaped - sub_means
+            if valid_mask is not None:
+                sub_stds = (
+                    (centered**2 * valid_mask).sum(dim=1, keepdim=True)
+                    / valid_mask.sum(dim=1, keepdim=True).clamp(min=1)
+                ).sqrt()
+            else:
+                sub_stds = reshaped.std(dim=1, keepdim=True)
+            normalized = centered / (sub_stds + 1e-8)
+        else:  # "center"
+            normalized = reshaped - sub_means
+
+        # Flatten and trim to original batch_size
+        advantage = normalized.view(-1)[:batch_size]
+
+        return advantage
+
+    def _deal_initial_hands_fixed_seed(self, n_cards: int, batch_size: int) -> None:
+        """Deal initial hands with fixed seed: games in same sub-batch get the same hand."""
+        player = self.players[0]
+        card_length = self.decks["main"].shape[1]
+        expanded_main_deck = self.decks["main"].unsqueeze(0).expand(batch_size, -1, -1)
+
+        # Vectorized: all games in same sub-batch get same cards
+        # Stack all deck orders: (n_sub_batches, deck_size)
+        stacked_orders = torch.stack(self.master_deck_orders["main"])
+
+        # Get cursor (same for all sub-batches)
+        cursor = self.deck_cursors["main"][0]
+
+        # Get indices for each sub-batch: (n_sub_batches, n_cards)
+        sub_batch_indices = stacked_orders[:, cursor : cursor + n_cards]
+
+        # Compute sub-batch ID for each game: (batch_size,)
+        sub_batch_ids = torch.arange(batch_size, device=self.device) // self.current_sub_batch_size
+
+        # Index to get indices for each game: (batch_size, n_cards)
+        indices = sub_batch_indices[sub_batch_ids]
+
+        # Update all cursors
+        for i in range(self.n_sub_batches):
+            self.deck_cursors["main"][i] += n_cards
+
+        # Expand indices for gather: (batch, n_cards) -> (batch, n_cards, card_length)
+        indices_expanded = indices.unsqueeze(2).expand(-1, -1, card_length)
+
+        # Gather cards: (batch, deck_size, card_length) -> (batch, n_cards, card_length)
+        player.cards_hand = torch.gather(expanded_main_deck, 1, indices_expanded)
+
+        # Mark these cards as unavailable in the deck
+        self.deck_availability["main"].scatter_(1, indices, False)
 
     def dump_model(self, model_path: str) -> None:
         torch.save(self.players[0].model, model_path)
@@ -195,6 +359,7 @@ class SoloLearningGame(BaseNNGame):
         if "baseline" in checkpoint:
             self.baseline = checkpoint["baseline"]
             logger.info(f"Restored baseline: {self.baseline:.2f}")
+        logger.info(f"Restored n_training_games_played: {self.players[0].n_training_games_played}")
 
     def run_eval_vs_random(self) -> tuple[float, float]:
         """Run evaluation against random players using the shared TensorBoard writer."""
@@ -238,14 +403,62 @@ class SoloLearningGame(BaseNNGame):
 
         return float(mean_score)
 
+    def initialize_baseline_from_eval(
+        self,
+        n_batches: int | None = None,
+        batch_size: int | None = None,
+    ) -> float:
+        """Initialize baseline from solo evaluation score.
+
+        This runs a solo evaluation and sets the baseline to the mean score,
+        providing a more accurate initial baseline than a hardcoded value.
+
+        Args:
+            n_batches: Number of evaluation batches (default: from eval_solo_config or 50)
+            batch_size: Games per batch (default: from eval_solo_config or 64)
+
+        Returns:
+            The mean score used as the new baseline.
+        """
+        # Use provided values or fall back to eval_solo_config or defaults
+        n_batches = n_batches or self.eval_solo_config.get("n_batches", 50)
+        batch_size = batch_size or self.eval_solo_config.get("batch_size", 64)
+
+        if self.verbose > 0:
+            logger.info(
+                f"Initializing baseline from solo eval ({n_batches} batches x {batch_size})..."
+            )
+
+        # Run evaluation without TensorBoard logging (just for baseline init)
+        scores = self.play_games_batches(n_batches=n_batches, batch_size=batch_size)
+        mean_score = scores.mean().item()
+
+        # Set baseline
+        old_baseline = self.baseline
+        self.baseline = mean_score
+
+        if self.verbose > 0:
+            logger.info(
+                f"Baseline initialized: {old_baseline:.2f} -> {self.baseline:.2f} "
+                f"(from {n_batches * batch_size} games)"
+            )
+
+        return float(mean_score)
+
     def log_hparams(self, extra_hparams: dict[str, Any] | None = None) -> None:
         """Log hyperparameters to TensorBoard for experiment comparison."""
+        # Count trainable parameters
+        n_trainable_params = sum(
+            p.numel() for p in self.players[0].model.parameters() if p.requires_grad
+        )
+
         hparams = {
             "player_type": self.player_type,
             "n_rounds": self.n_rounds,
             "draft_size": self.draft_size,
-            "use_draft": self.use_draft,
+            "use_hand": self.use_hand,
             "n_cards_hand": self.n_cards_hand,
+            "n_trainable_params": n_trainable_params,
             "rl_params": self.rl_params,
             "model_params": self.model_params,
             "player_params": self.player_params,
@@ -256,6 +469,8 @@ class SoloLearningGame(BaseNNGame):
         if extra_hparams:
             hparams.update(extra_hparams)
         if self.writer is not None:
+            # Log trainable params as a scalar for easy comparison across runs
+            self.writer.add_scalar("model/n_trainable_params", n_trainable_params, 0)
             # Use add_text instead of add_hparams to avoid creating timestamp subdirectories
             hparams_text = "\n".join(f"**{k}**: {v}" for k, v in hparams.items())
             self.writer.add_text("hparams", hparams_text, 0)
@@ -263,7 +478,7 @@ class SoloLearningGame(BaseNNGame):
     def _play_from_hand(self) -> torch.Tensor:
         """Choose and play a card from hand. Returns probability of the selection.
 
-        Used when use_draft=True. The model selects one card from the hand to play.
+        Used when use_hand=True. The model selects one card from the hand to play.
         """
         player = self.players[0]
 
@@ -285,27 +500,23 @@ class SoloLearningGame(BaseNNGame):
     def _draft_to_hand(self) -> torch.Tensor:
         """Draft a card from the river to replace the played card in hand.
 
-        Used when use_draft=True. The model selects one card from the river to add to hand.
+        Used when use_hand=True. The model selects one card from the river to add to hand.
         """
         player = self.players[0]
         batch_size = player.get_current_batch_size()
 
-        # Check if there are enough cards in the deck
-        available_counts = self.deck_availability["main"].sum(dim=1)  # (batch,)
-        can_draft = available_counts >= self.draft_size
+        # With peer_relative_reward and appropriate deck/draft sizes, deck won't be exhausted
+        if not self.peer_relative_reward:
+            # Check if there are enough cards in the deck (only needed for non-peer mode)
+            available_counts = self.deck_availability["main"].sum(dim=1)  # (batch,)
+            can_draft = available_counts >= self.draft_size
 
-        if not can_draft.any():
-            # No drafting possible (late game), return prob=1 (no decision)
-            return torch.ones(batch_size, device=self.device)
+            if not can_draft.any():
+                # No drafting possible (late game), return prob=1 (no decision)
+                return torch.ones(batch_size, device=self.device)
 
         # Sample cards from the deck for the river
-        # For batches that can't draft, we still sample but won't use the result
-        # Use min of draft_size and available cards to avoid errors
-        indices = torch.multinomial(
-            self.deck_availability["main"].float(),
-            min(self.draft_size, int(available_counts.min().item())),
-            replacement=False,
-        )  # (batch, draft_size or less)
+        indices = self._sample_draft_indices("main", batch_size)  # (batch, draft_size)
 
         # Get the actual card tensors
         river_cards = self.decks["main"][indices]  # (batch, draft_size, card_dim)
@@ -323,16 +534,54 @@ class SoloLearningGame(BaseNNGame):
         selected_deck_indices = torch.gather(indices, 1, index).squeeze(1)  # (batch,)
         self.deck_availability["main"][batch_indices, selected_deck_indices] = False
 
-        # Get probability (1.0 for batches that couldn't draft)
-        probability = torch.ones(batch_size, device=self.device)
-        probability[can_draft] = torch.gather(probabilities, 1, index).squeeze(1)[can_draft]
+        # Get probability
+        probability = torch.gather(probabilities, 1, index).squeeze(1)  # (batch,)
         return probability
+
+    def _sample_draft_indices(self, deck_type: str, batch_size: int) -> torch.Tensor:
+        """Sample draft indices from deck, using sequential dealing if peer_relative_reward.
+
+        Args:
+            deck_type: "main" or "bonus"
+            batch_size: Number of games in batch
+
+        Returns:
+            Tensor of shape (batch, draft_size) with card indices
+        """
+        if self.peer_relative_reward:
+            # Vectorized: all games in same sub-batch see same cards
+            # Stack all deck orders: (n_sub_batches, deck_size)
+            stacked_orders = torch.stack(self.master_deck_orders[deck_type])
+
+            # Get cursor (same for all sub-batches)
+            cursor = self.deck_cursors[deck_type][0]
+
+            # Get indices for each sub-batch: (n_sub_batches, draft_size)
+            sub_batch_indices = stacked_orders[:, cursor : cursor + self.draft_size]
+
+            # Compute sub-batch ID for each game: (batch_size,)
+            sub_batch_ids = (
+                torch.arange(batch_size, device=self.device) // self.current_sub_batch_size
+            )
+
+            # Index to get indices for each game: (batch_size, draft_size)
+            indices = sub_batch_indices[sub_batch_ids]
+
+            # Update all cursors
+            for i in range(self.n_sub_batches):
+                self.deck_cursors[deck_type][i] += self.draft_size
+        else:
+            # Random sampling (original behavior)
+            indices = torch.multinomial(
+                self.deck_availability[deck_type].float(), self.draft_size, replacement=False
+            )
+        return indices  # (batch, draft_size)
 
     def _play_card(self, type: str) -> torch.Tensor:
         """Play a card of the given type (main or bonus).
 
-        For main cards with use_draft=False: samples from deck and plays directly.
-        For main cards with use_draft=True: handled by _play_from_hand/_draft_to_hand.
+        For main cards with use_hand=False: samples from deck and plays directly.
+        For main cards with use_hand=True: handled by _play_from_hand/_draft_to_hand.
         For bonus cards: always samples from bonus deck.
         """
         batch_size = self.players[0].get_current_batch_size()
@@ -340,13 +589,12 @@ class SoloLearningGame(BaseNNGame):
         # For bonus cards, check if we need to reshuffle discarded cards
         # Per official rules: "If the Sanctuary deck is empty, shuffle the
         # discarded Sanctuary cards to form a new deck."
-        if type == "bonus":
+        # (Skipped when peer_relative_reward as deck is pre-shuffled and sized appropriately)
+        if type == "bonus" and not self.peer_relative_reward:
             self.reshuffle_bonus_discard_if_needed(n_cards_needed=self.draft_size)
 
-        # select indices of cards to sample from the main deck
-        indices = torch.multinomial(
-            self.deck_availability[type].float(), self.draft_size, replacement=False
-        )  # (batch, draft_size)
+        # select indices of cards to sample from the deck
+        indices = self._sample_draft_indices(type, batch_size)  # (batch, draft_size)
         # sample the cards
         possible_cards_tensor = self.decks[type][indices]  # (batch, draft_size, MainCard.length())
         probabilities, index, selected_cards = self.players[0].evaluate_cards(
@@ -405,7 +653,7 @@ class SoloLearningGame(BaseNNGame):
         """
         probabilities_list: list[torch.Tensor] = []
 
-        if self.use_draft:
+        if self.use_hand:
             # Draft mode: play from hand, then draft to refill hand
             picked_probability_play = self._play_from_hand()
             probabilities_list.append(picked_probability_play)
@@ -414,7 +662,7 @@ class SoloLearningGame(BaseNNGame):
             picked_probability_draft = self._draft_to_hand()
             probabilities_list.append(picked_probability_draft)
         else:
-            # No draft: pick directly from deck (original behavior)
+            # No draft: pick directly from deck (legacy behavior)
             picked_probability_main = self._play_card("main")
             probabilities_list.append(picked_probability_main)
 
@@ -431,16 +679,71 @@ class SoloLearningGame(BaseNNGame):
         return picked_probabilities
 
     def learning_step(self) -> None:
+        batch_size = self.rl_params["train_batch_size"]
+
         # empty probas tensor for training. dim 0 is batch, but no values
-        self.picked_probabilities = torch.ones(
-            self.rl_params["train_batch_size"], 0, device=self.device
-        )
+        self.picked_probabilities = torch.ones(batch_size, 0, device=self.device)
         # play the game and get the log probabilities
-        self.play_games_batch(self.rl_params["train_batch_size"], learning_mode=True)
+        self.play_games_batch(batch_size, learning_mode=True)
         log_probs = torch.log(self.picked_probabilities)  # (batch, n_rounds)
         # apply final_count_from_tensor_field for each element of the batch
         scores = self.get_scores()[:, 0]
-        advantage = scores - self.baseline
+
+        # Reward shaping: Count how many times the model played increasing IDs
+        # This directly rewards the BEHAVIOR that leads to bonus cards, not the
+        # delayed outcome. More direct credit assignment.
+        # Normalized to [-1, 1]: 0 increases = -1, 3.5 increases = 0, 7 increases = +1
+        id_increase_reward_weight = self.rl_params.get("id_increase_reward_weight", 0.0)
+        max_increases = self.n_rounds - 1  # 7 possible increases for 8 rounds
+        mid_increases = max_increases / 2.0  # 3.5 = random expectation
+        if id_increase_reward_weight > 0:
+            player = self.players[0]
+            main_card_ids = player.fields["main"][:, :, 0]  # (batch, 8)
+            # Count ID increases: id[i+1] > id[i]
+            id_diffs = main_card_ids[:, 1:] > main_card_ids[:, :-1]  # (batch, 7) bool
+            n_increases = id_diffs.float().sum(dim=1)  # (batch,)
+            # Normalize to [-1, 1]
+            increases_normalized = (n_increases - mid_increases) / mid_increases
+            shaped_reward = scores + id_increase_reward_weight * increases_normalized
+        else:
+            n_increases = None
+            shaped_reward = scores
+
+        # DEPRECATED: bonus_reward_weight - use id_increase_reward_weight instead
+        # The bonus card count is an indirect signal; id_increase is the direct behavior
+        bonus_reward_weight = self.rl_params.get("bonus_reward_weight", 0.0)
+        max_bonus_cards = self.n_rounds - 1  # 7 for 8 rounds
+        mid_bonus_cards = max_bonus_cards / 2.0  # 3.5 = random average
+        if bonus_reward_weight > 0 and self.use_bonus_cards:
+            bonus_cards_played = self.get_bonus_cards_played()[:, 0]  # (batch,)
+            bonus_normalized = (bonus_cards_played - mid_bonus_cards) / mid_bonus_cards
+            shaped_reward = shaped_reward + bonus_reward_weight * bonus_normalized
+        else:
+            bonus_cards_played = None
+
+        # Reward shaping: optionally reward playing lower card IDs
+        # WARNING: This conflicts with id_increase_reward! Low IDs make increasing harder.
+        # Only use this if you specifically need "draft first" behavior over bonus cards.
+        # Normalized to [-1, 1]: -1 = ID 68, 0 = ID 34.5 (middle), +1 = ID 1
+        low_id_reward_weight = self.rl_params.get("low_id_reward_weight", 0.0)
+        if low_id_reward_weight > 0:
+            player = self.players[0]
+            main_card_ids = player.fields["main"][:, :, 0]  # (batch, 8)
+            avg_card_id = main_card_ids.mean(dim=1)  # (batch,)
+            max_card_id = 68.0  # Cards are numbered 1-68
+            mid_card_id = max_card_id / 2.0  # 34 = middle
+            low_id_normalized = (mid_card_id - avg_card_id) / mid_card_id
+            shaped_reward = shaped_reward + low_id_reward_weight * low_id_normalized
+
+        # Compute advantage: peer-relative (within-sub-batch normalization) or baseline-based
+        if self.peer_relative_reward:
+            # Peer-relative: compare against games in the same sub-batch
+            # Games in same sub-batch faced identical cards, so differences are purely due
+            # to model decisions
+            advantage = self._compute_peer_relative_advantage(shaped_reward)
+        else:
+            # Traditional baseline-based advantage
+            advantage = shaped_reward - self.baseline
 
         loss = (-torch.sum(log_probs, 1) * advantage).mean()  # scalar
         self.optimizer.zero_grad()
@@ -471,13 +774,44 @@ class SoloLearningGame(BaseNNGame):
             self.writer.add_scalar(
                 "solo_train_score/std", scores.std().item(), n_training_games_played
             )
+            # Log bonus cards played (max 7 for 8 rounds)
+            if self.use_bonus_cards:
+                # Reuse bonus_cards_played if already computed for reward shaping
+                if bonus_cards_played is None:
+                    bonus_cards_played = self.get_bonus_cards_played()[:, 0]  # (batch,)
+                self.writer.add_scalar(
+                    "solo_train_bonus/mean",
+                    bonus_cards_played.mean().item(),
+                    n_training_games_played,
+                )
+                self.writer.add_scalar(
+                    "solo_train_bonus/max", bonus_cards_played.max().item(), n_training_games_played
+                )
+            # Log average card ID (lower = better for draft priority)
+            main_card_ids = self.players[0].fields["main"][:, :, 0]  # (batch, 8)
+            self.writer.add_scalar(
+                "solo_train_avg_card_id/mean", main_card_ids.mean().item(), n_training_games_played
+            )
+            # Log ID increases (key metric for bonus card acquisition behavior)
+            if n_increases is None:
+                id_diffs = main_card_ids[:, 1:] > main_card_ids[:, :-1]
+                n_increases = id_diffs.float().sum(dim=1)
+            self.writer.add_scalar(
+                "solo_train_id_increases/mean", n_increases.mean().item(), n_training_games_played
+            )
+            # Log shaped reward if using any reward shaping
+            if id_increase_reward_weight > 0 or bonus_reward_weight > 0 or low_id_reward_weight > 0:
+                self.writer.add_scalar(
+                    "solo_train_shaped_reward/mean",
+                    shaped_reward.mean().item(),
+                    n_training_games_played,
+                )
             self.writer.add_scalar("baseline/value", self.baseline, n_training_games_played)
             self.writer.add_scalar(
                 "advantage/mean", advantage.mean().item(), n_training_games_played
             )
             self.writer.add_scalar("advantage/std", advantage.std().item(), n_training_games_played)
             self.writer.add_scalar("loss/policy", loss.item(), n_training_games_played)
-            self.writer.add_scalar("step_id", self.step_id, n_training_games_played)
 
         if self.verbose > 0:
             logger.info(
@@ -487,9 +821,12 @@ class SoloLearningGame(BaseNNGame):
                 f"Loss: {loss.item():.2f}. "
                 f"Games: {n_training_games_played}"
             )
-        # update the baseline
+        # Update the baseline EMA (use shaped_reward if reward shaping is enabled)
+        # In peer_relative_reward mode, baseline is not used for advantage but still
+        # tracked for monitoring
         self.baseline = (
-            self.baseline + self.rl_params["update_baseline_rate"] * (scores.mean() - self.baseline)
+            self.baseline
+            + self.rl_params["update_baseline_rate"] * (shaped_reward.mean() - self.baseline)
         ).item()
         self.step_id += 1
 
@@ -536,12 +873,18 @@ def main(
     grad_clip: Annotated[
         float | None, typer.Option(help="Gradient clipping max norm (None to disable)")
     ] = None,
-    use_draft: Annotated[
+    use_hand: Annotated[
         bool, typer.Option(help="Enable draft mechanism (hand management)")
     ] = False,
     n_cards_hand: Annotated[
         int, typer.Option(help="Number of cards in hand (when using draft)")
     ] = 3,
+    peer_relative_reward: Annotated[
+        bool, typer.Option(help="Use peer-relative reward (same deck for all games in batch)")
+    ] = False,
+    advantage_peer_normalization: Annotated[
+        str, typer.Option(help="Peer-relative mode: 'zscore' or 'center'")
+    ] = "zscore",
 ) -> None:
     """Run a solo learning game."""
     logger.remove()  # remove default stderr handler
@@ -587,7 +930,6 @@ def main(
             "dropout_rate": 0.1,
         }
         player_params = {
-            "use_cards_hand_in_state": False,
             "use_mode_embedding": use_mode_embedding,
         }
     else:
@@ -597,6 +939,8 @@ def main(
         "prior_baseline_score": 29,
         "train_batch_size": batch_size,
         "update_baseline_rate": baseline_update_rate,
+        "peer_relative_reward": peer_relative_reward,
+        "advantage_peer_normalization": advantage_peer_normalization,
     }
     if grad_clip is not None:
         rl_params["grad_clip"] = grad_clip
@@ -612,7 +956,7 @@ def main(
         },
         rl_params=rl_params,
         draft_size=draft_size,
-        use_draft=use_draft,
+        use_hand=use_hand,
         n_cards_hand=n_cards_hand,
         eval_vs_random_config=eval_vs_random_config,
         eval_solo_config=eval_solo_config,

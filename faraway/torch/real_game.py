@@ -7,6 +7,7 @@ from collections.abc import Sequence
 from typing import Annotated
 
 import torch
+import torch as torch_module
 import typer
 from loguru import logger
 
@@ -14,7 +15,9 @@ from faraway.core.base_player import BasePlayer
 from faraway.core.data_structures import MainCard, MainCardsSeries
 from faraway.core.human_player import HumanPlayer
 from faraway.torch.base_game import BaseNNGame
+from faraway.torch.mlp_player import MLPPlayer
 from faraway.torch.nn_player import BaseNNPlayer
+from faraway.torch.transformers_player import TransformersPlayer
 
 MAP_INDEX_IN_FLATTENED_CARD = MainCard.get_field_index("map", "assets")
 
@@ -41,6 +44,11 @@ class RealNNGame(BaseNNGame):
         super().reset_games_batch(batch_size)
         # deal initial hands to all players (3 cards each)
         self.deal_initial_hands(n_cards=3, batch_size=batch_size)
+        # Track draft priority wins per player: (batch_size, n_players)
+        # Counts how many times each player had the lowest card ID (drafts first)
+        self.draft_priority_wins = torch.zeros(
+            batch_size, len(self.players), dtype=torch.long, device=self.device
+        )
         if self.verbose > 98:
             logger.debug(f"BATCH SETUP: batch_size={batch_size}")
             for i in range(batch_size):
@@ -137,20 +145,394 @@ class RealNNGame(BaseNNGame):
             ],
             dim=1,
         )
-        draft_pool = self.draw_draft_pool()
-        if self.verbose > 98:
-            logger.debug("RESOLVE ACTIONS ONE GAME")
-        for i in range(batch_size):
-            if self.verbose > 98:
-                logger.debug(f"Game #{i}")
-            self.resolve_actions_one_game(
-                last_card_played_ids[i, :],
-                draft_pool[i : i + 1, :, :],
-                index_played_from_hand[i, :],
-                n_bonus_cards_to_draw[i, :],
-                game_id=i,
+
+        # Track draft priority: who played the lowest card ID (gets to draft first)
+        # Only count for rounds 0-6 (7 draft opportunities, no draft in round 7)
+        if self.round_index < self.n_rounds - 1:
+            draft_winner = last_card_played_ids.argmin(dim=1)  # (batch_size,)
+            # One-hot encode and accumulate
+            self.draft_priority_wins.scatter_add_(
+                1,
+                draft_winner.unsqueeze(1),
+                torch.ones(batch_size, 1, dtype=torch.long, device=self.device),
             )
+
+        draft_pool = self.draw_draft_pool()
+
+        # Batched draft resolution (one forward pass per player instead of per player per game)
+        self.resolve_draft_batched(
+            last_card_played_ids,
+            draft_pool,
+            index_played_from_hand,
+        )
+
+        # Batched bonus card resolution (one forward pass per player)
+        if self.verbose > 98:
+            logger.debug("RESOLVE BONUS CARDS (BATCHED)")
+        self.resolve_bonus_cards_batched(n_bonus_cards_to_draw)
+
         self.round_index += 1
+
+    def resolve_draft_batched(
+        self,
+        last_card_played_ids: torch.Tensor,  # (batch_size, n_players)
+        draft_pool: torch.Tensor,  # (batch_size, n_players + 1, card_length)
+        index_played_from_hand: torch.Tensor,  # (batch_size, n_players)
+    ) -> None:
+        """Resolve draft phase for all games in a batched manner.
+
+        Key optimization: Pre-compute all player evaluations in one forward pass per player,
+        then allocate cards sequentially using masking (no additional forward passes).
+        """
+        if self.round_index >= self.n_rounds - 1:
+            return  # No draft in last round
+
+        batch_size = draft_pool.shape[0]
+        n_draft_cards = draft_pool.shape[1]
+        n_players = len(self.players)
+
+        # Pre-compute logits for all players on full draft pool (one forward pass per player)
+        # Shape: (n_players, batch_size, n_draft_cards)
+        all_logits_list = []
+        for player in self.players:
+            logits, _, _ = player.evaluate_cards(
+                draft_pool, self.round_index, mode="draft", return_logits=True
+            )
+            all_logits_list.append(logits)
+        all_logits = torch.stack(all_logits_list, dim=0)  # (n_players, batch_size, n_draft_cards)
+
+        # Track which cards are taken: (batch_size, n_draft_cards)
+        card_taken = torch.zeros(batch_size, n_draft_cards, dtype=torch.bool, device=self.device)
+
+        # Determine priority order for each game (lowest card ID goes first)
+        # priority_order[game, rank] = player_idx
+        priority_order = last_card_played_ids.argsort(dim=1)  # (batch_size, n_players)
+
+        # Allocate cards in priority order
+        for rank in range(n_players):
+            # Get which player has this priority rank for each game
+            player_indices = priority_order[:, rank]  # (batch_size,)
+
+            # Gather logits for the appropriate player for each game
+            # all_logits: (n_players, batch_size, n_draft_cards)
+            # We need logits[player_indices[b], b, :] for each b
+            batch_indices = torch.arange(batch_size, device=self.device)
+            current_logits = all_logits[
+                player_indices, batch_indices, :
+            ]  # (batch_size, n_draft_cards)
+
+            # Mask out already-taken cards
+            current_logits = current_logits.masked_fill(card_taken, float("-inf"))
+
+            # Select best card for each game
+            selected_indices = current_logits.argmax(dim=1)  # (batch_size,)
+
+            # Mark cards as taken
+            card_taken.scatter_(1, selected_indices.unsqueeze(1), True)
+
+            # Get the selected cards
+            card_length = draft_pool.shape[2]
+            selected_indices_expanded = (
+                selected_indices.unsqueeze(1).unsqueeze(2).expand(-1, 1, card_length)
+            )
+            selected_cards = torch.gather(draft_pool, 1, selected_indices_expanded).squeeze(
+                1
+            )  # (batch_size, card_length)
+
+            # Place cards in each player's hand at the correct position
+            for game_idx in range(batch_size):
+                player_idx = player_indices[game_idx].item()
+                player = self.players[player_idx]
+                hand_position = index_played_from_hand[game_idx, player_idx].item()
+                player.cards_hand[game_idx, hand_position, :] = selected_cards[game_idx]
+
+                if self.verbose > 98:
+                    logger.debug(
+                        f"    Game #{game_idx}: Player #{player_idx} drafts card "
+                        f"{MainCard.from_numpy(selected_cards[game_idx].cpu().numpy())} "
+                        f"at hand position {hand_position}"
+                    )
+
+    def resolve_bonus_cards_batched(
+        self,
+        n_bonus_cards_to_draw: torch.Tensor,  # (batch_size, n_players)
+    ) -> None:
+        """Resolve bonus card draws in batched manner (one forward pass per player).
+
+        Process each player's bonus draws across all games in a single batch.
+        Order between players doesn't matter for evaluation purposes.
+        """
+        if self.round_index == 0:
+            return  # No bonus cards in first round
+
+        card_length = self.decks["bonus"].shape[1]
+
+        for player_idx, player in enumerate(self.players):
+            # Find games where this player triggers bonus (current > previous)
+            triggers_bonus = (
+                player.fields["main"][:, self.round_index, 0]
+                > player.fields["main"][:, self.round_index - 1, 0]
+            )  # (batch_size,)
+
+            if not triggers_bonus.any():
+                continue
+
+            game_indices = triggers_bonus.nonzero().squeeze(1)  # indices of games to process
+            n_games = len(game_indices)
+
+            # Get number of cards to draw per game
+            n_cards_per_game = n_bonus_cards_to_draw[game_indices, player_idx]  # (n_games,)
+            max_cards = int(n_cards_per_game.max().item())
+
+            if max_cards == 0:
+                continue
+
+            # Batch-draw bonus cards for all triggered games
+            # We'll pad to max_cards and use masking
+            all_bonus_cards = torch.zeros(n_games, max_cards, card_length, device=self.device)
+            valid_mask = torch.zeros(n_games, max_cards, dtype=torch.bool, device=self.device)
+            all_drawn_indices: list[
+                torch.Tensor | None
+            ] = []  # Track which deck indices were drawn per game
+
+            for i, game_idx in enumerate(game_indices):
+                gid = game_idx.item()
+                n_to_draw = int(n_cards_per_game[i].item())
+
+                if n_to_draw == 0:
+                    all_drawn_indices.append(None)
+                    continue
+
+                # Reshuffle if needed
+                self.reshuffle_bonus_discard_if_needed(
+                    game_ids=torch.tensor([gid], device=self.device),
+                    n_cards_needed=n_to_draw,
+                )
+
+                # Draw cards
+                n_available = self.deck_availability["bonus"][gid].sum().item()
+                if n_to_draw > n_available:
+                    raise ValueError(
+                        f"Game {gid}: Can't draw {n_to_draw} bonus cards, "
+                        f"only {n_available} available"
+                    )
+
+                indices = torch.multinomial(
+                    self.deck_availability["bonus"][gid : gid + 1].float(),
+                    n_to_draw,
+                    replacement=False,
+                ).squeeze(0)  # (n_to_draw,)
+
+                # Mark as unavailable
+                self.deck_availability["bonus"][gid].scatter_(0, indices, False)
+
+                # Gather the cards
+                drawn_cards = self.decks["bonus"][indices]  # (n_to_draw, card_length)
+
+                # Store in padded tensor
+                all_bonus_cards[i, :n_to_draw, :] = drawn_cards
+                valid_mask[i, :n_to_draw] = True
+                all_drawn_indices.append(indices)
+
+            # Single forward pass for all games where this player draws
+            logits, _, _ = player.evaluate_cards(
+                all_bonus_cards,
+                self.round_index,
+                mode="bonus",
+                games_indices=game_indices,
+                return_logits=True,
+            )  # (n_games, max_cards)
+
+            # Mask invalid (padded) positions
+            logits = logits.masked_fill(~valid_mask, float("-inf"))
+
+            # Select best card per game
+            selected_indices = logits.argmax(dim=1)  # (n_games,)
+
+            # Gather selected cards and assign to player fields
+            selected_indices_expanded = (
+                selected_indices.unsqueeze(1).unsqueeze(2).expand(-1, 1, card_length)
+            )
+            selected_cards = torch.gather(all_bonus_cards, 1, selected_indices_expanded).squeeze(1)
+
+            # Assign to bonus field and handle discards
+            for i, game_idx in enumerate(game_indices):
+                gid = game_idx.item()
+                player.fields["bonus"][gid, self.round_index - 1, :] = selected_cards[i]
+
+                # Track discarded cards (drawn but not selected)
+                drawn_indices = all_drawn_indices[i]
+                if drawn_indices is not None and len(drawn_indices) > 1:
+                    selected_idx = selected_indices[i].item()
+                    mask = torch.arange(len(drawn_indices), device=self.device) != selected_idx
+                    discarded = drawn_indices[mask]
+                    if discarded.numel() > 0:
+                        self.bonus_discard[gid, discarded] = True
+
+                if self.verbose > 98:
+                    logger.debug(
+                        f"    Game #{gid}: Player #{player_idx} plays bonus card "
+                        f"{MainCard.from_numpy(selected_cards[i].cpu().numpy())}"
+                    )
+
+    def resolve_bonus_cards_one_game(
+        self,
+        last_card_played_ids: torch.Tensor,  # (n_players,)
+        n_bonus_cards_to_draw: torch.Tensor,  # (n_players,)
+        game_id: int,
+    ) -> None:
+        """Resolve bonus card draws for one game (legacy sequential version)."""
+        if self.round_index == 0:
+            return  # No bonus cards in first round
+
+        # Process players in priority order (lowest card ID first)
+        while last_card_played_ids.min() < 100:
+            p = last_card_played_ids.argmin()
+            last_card_played_ids[p] = 100
+
+            player = self.players[p]
+            n_to_draw = n_bonus_cards_to_draw[p].item()
+
+            # Check if player triggered bonus (current card > previous card)
+            if (
+                player.fields["main"][game_id, self.round_index, 0]
+                > player.fields["main"][game_id, self.round_index - 1, 0]
+            ):
+                self.resolve_bonus_for_player(player, n_to_draw, game_id)
+
+    def resolve_bonus_for_player(
+        self,
+        player: BaseNNPlayer,
+        n_bonus_cards_to_draw: int,
+        game_id: int,
+    ) -> None:
+        """Handle bonus card draw and selection for one player."""
+        # Check if we need to reshuffle discarded bonus cards
+        self.reshuffle_bonus_discard_if_needed(
+            game_ids=torch.tensor([game_id], device=self.device),
+            n_cards_needed=n_bonus_cards_to_draw,
+        )
+
+        # Cap to available bonus cards
+        n_available = self.deck_availability["bonus"][game_id, :].sum().item()
+        if n_bonus_cards_to_draw > n_available:
+            raise ValueError(
+                f"Player can't draw {n_bonus_cards_to_draw} "
+                f"bonus cards, only {n_available} available (even after reshuffle)"
+            )
+
+        indices = torch.multinomial(
+            self.deck_availability["bonus"].float()[game_id : game_id + 1, :],
+            n_bonus_cards_to_draw,
+            replacement=False,
+        )
+        self.deck_availability["bonus"][game_id : game_id + 1, :].scatter_(1, indices, False)
+
+        # Gather bonus cards
+        card_length = self.decks["bonus"].shape[1]
+        indices_expanded = indices.unsqueeze(2).expand(-1, -1, card_length)
+        expanded_bonus_deck = self.decks["bonus"].unsqueeze(0)  # (1, 45, 24)
+        bonus_cards_drawn = torch.gather(
+            expanded_bonus_deck, 1, indices_expanded
+        )  # (1, n_to_draw, 24)
+
+        # Player evaluates and selects one bonus card
+        _, index, selected_card = player.evaluate_cards(
+            bonus_cards_drawn,
+            self.round_index,
+            mode="bonus",
+            games_indices=slice(game_id, game_id + 1),
+        )
+        player.fields["bonus"][game_id : game_id + 1, self.round_index - 1, :] = selected_card
+
+        # Track discarded bonus cards
+        selected_index = int(index.squeeze()) if hasattr(index, "squeeze") else int(index)
+        discarded_indices = indices.squeeze(0).clone()
+        mask = torch.arange(discarded_indices.shape[0], device=self.device) != selected_index
+        discarded_indices = discarded_indices[mask]
+        if discarded_indices.numel() > 0:
+            self.bonus_discard[game_id, discarded_indices] = True
+
+        if self.verbose > 98:
+            logger.debug(f"    Player draws {n_bonus_cards_to_draw} bonus cards")
+            logger.debug(
+                f"    Player plays bonus card: "
+                f"{MainCard.from_numpy(selected_card[0].cpu().numpy())}"
+            )
+
+    def get_draft_priority_rate(self) -> torch.Tensor:
+        """Get the draft priority win rate for each player.
+
+        Returns:
+            Tensor of shape (batch_size, n_players) with rate in [0, 1].
+            Each value is the fraction of 7 draft rounds where that player had priority.
+        """
+        n_draft_rounds = self.n_rounds - 1  # 7 draft opportunities
+        return self.draft_priority_wins.float() / n_draft_rounds
+
+    def run_tournament(
+        self,
+        n_batches: int,
+        batch_size: int,
+        player_names: list[str] | None = None,
+    ) -> tuple[list[int], list[float], list[float], list[float]]:
+        """Run a tournament and return stats per player.
+
+        Args:
+            n_batches: Number of batches to play
+            batch_size: Number of games per batch
+            player_names: Optional names for TensorBoard logging
+
+        Returns:
+            Tuple of (wins, mean_scores, mean_bonus_cards, mean_draft_priority_rate) per player
+        """
+        all_scores: list[torch.Tensor] = []
+        all_bonus_cards: list[torch.Tensor] = []
+        all_draft_priority: list[torch.Tensor] = []
+
+        for i in range(n_batches):
+            self.play_games_batch(batch_size)
+            if self.verbose > 1:
+                logger.info(f"Batch {i + 1} completed")
+            all_scores.append(self.get_scores())
+            if self.use_bonus_cards:
+                all_bonus_cards.append(self.get_bonus_cards_played())
+            all_draft_priority.append(self.get_draft_priority_rate())
+
+        scores = torch.cat(all_scores, dim=0)  # (total_games, players)
+        self.total_games_played += n_batches * batch_size
+
+        winner = scores.argmax(dim=1)
+        wins = []
+        win_rate = []
+        for player_id in range(len(self.players)):
+            wins.append(torch.where(winner == player_id)[0].shape[0])
+            win_rate.append(wins[-1] / (n_batches * batch_size) * 100)
+
+        mean_scores = scores.mean(dim=0).tolist()
+
+        # Compute mean bonus cards per player
+        if self.use_bonus_cards and all_bonus_cards:
+            bonus_cards = torch.cat(all_bonus_cards, dim=0)
+            mean_bonus_cards = bonus_cards.mean(dim=0).tolist()
+        else:
+            mean_bonus_cards = [0.0] * len(self.players)
+
+        # Compute mean draft priority rate per player
+        draft_priority = torch.cat(all_draft_priority, dim=0)  # (total_games, players)
+        mean_draft_priority = draft_priority.mean(dim=0).tolist()
+
+        if self.verbose > 0:
+            logger.info(
+                f"Tournament completed.\n"
+                f"Mean scores: {mean_scores}\n"
+                f"Wins: {wins}\n"
+                f"Win rate: {win_rate}%\n"
+                f"Mean bonus cards: {mean_bonus_cards}\n"
+                f"Mean draft priority rate: {[f'{r:.1%}' for r in mean_draft_priority]}\n"
+            )
+
+        return wins, mean_scores, mean_bonus_cards, mean_draft_priority
 
     def resolve_actions_one_game(
         self,
@@ -160,6 +542,7 @@ class RealNNGame(BaseNNGame):
         n_bonus_cards_to_draw: torch.Tensor,  # (n_players,)
         game_id: int,
     ) -> None:
+        """Legacy method - kept for backwards compatibility."""
         # exapnad( add one dim before other dims)
         draft_pool = draft_pool[:, :, :].clone()
         # loop other players from highest to lowest card id
@@ -335,7 +718,15 @@ def main(
     player_names: list[str] = []
     for player in players or []:
         if player.endswith(".pt"):
-            players_list.append(BaseNNPlayer.load(player))
+            # Auto-detect player type from checkpoint
+            checkpoint = torch_module.load(player, map_location="cpu", weights_only=False)
+            player_type = checkpoint.get(
+                "player_type", "mlp"
+            )  # default to mlp for backwards compat
+            if player_type == "transformer":
+                players_list.append(TransformersPlayer.load(player))
+            else:
+                players_list.append(MLPPlayer.load(player))
             # Extract a short name from the path for TensorBoard labels
             player_names.append(player.replace("/", "_").replace(".pt", ""))
         elif player == "human":

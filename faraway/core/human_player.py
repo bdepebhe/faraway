@@ -14,6 +14,7 @@ class HumanPlayer(BasePlayer):
         round_index: int,
         mode: str = "play",
         games_indices: slice | range | None = None,
+        return_logits: bool = False,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         if games_indices is None:
             games_indices = range(self.get_current_batch_size())
