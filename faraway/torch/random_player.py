@@ -17,6 +17,7 @@ class RandomPlayer(BaseNNPlayer):
         mode: str = "play",
         games_indices: slice | range | None = None,
         return_logits: bool = False,
+        temperature: float = 1.0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Evaluate possible cards and select one randomly.
 
@@ -27,6 +28,7 @@ class RandomPlayer(BaseNNPlayer):
             games_indices: Optional slice or indices to select specific batch elements from fields.
                            If None, uses all batch elements. Use slice(i, i+1) for single element.
             return_logits: If True, return logits instead of probabilities as first element
+            temperature: Softmax temperature for exploration (ignored for random player)
         """
         # for random model, just use uniform logits
         logits = torch.zeros(

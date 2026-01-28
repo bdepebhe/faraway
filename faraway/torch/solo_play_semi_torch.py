@@ -28,7 +28,12 @@ class TorchSimpleSoloPlay(SoloPlay):
         self.model = self._create_model(model_path)
         self.prior_baseline_score = prior_baseline_score
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=0.00001)
-        self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if device is not None:
+            self.device = device
+        elif torch.cuda.is_available():
+            self.device = torch.device("cuda")
+        else:
+            self.device = torch.device("cpu")
 
     def reset(self) -> None:
         super().reset()

@@ -4,7 +4,7 @@
 # Usage:
 #   python -m faraway.torch.main configs/transformer_large.yaml
 
-experiment_name: "transfo_peer_relative2"
+experiment_name: "transfo_peer_relative_temp2"
 
 player_type: "transformer"
 n_rounds: 8
@@ -46,5 +46,7 @@ phases:
       peer_relative_reward: true
       advantage_peer_normalization: "center"
       peer_sub_batch_size: 16
+      initial_temperature: 10.0
+      temperature_decay: 0.9999
     optimizer_params:
       lr: 0.0001

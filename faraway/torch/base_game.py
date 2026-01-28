@@ -280,9 +280,14 @@ class BaseNNGame(ABC):
     ):
         self.n_rounds = n_rounds
         self.use_bonus_cards = use_bonus_cards
-        self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        main_deck = get_main_deck_tensor()
-        bonus_deck = get_bonus_deck_tensor()
+        if device is not None:
+            self.device = device
+        elif torch.cuda.is_available():
+            self.device = torch.device("cuda")
+        else:
+            self.device = torch.device("cpu")
+        main_deck = get_main_deck_tensor().to(self.device)
+        bonus_deck = get_bonus_deck_tensor().to(self.device)
         self.decks = {
             "main": main_deck,
             "bonus": bonus_deck,

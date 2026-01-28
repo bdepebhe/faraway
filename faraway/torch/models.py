@@ -182,6 +182,14 @@ class TransformerCardModel(nn.Module):  # type: ignore[misc]
         # For transformer: True means "ignore this position"
 
         # Self-attention between cards
+        # Note: If all positions are masked (all cards empty), attention can produce NaN
+        # We ensure at least one position is valid by unmasking position 0 if all are masked
+        all_masked = card_mask.all(dim=1, keepdim=True)  # (batch, 1)
+        if all_masked.any():
+            # Unmask position 0 for batches where all positions are masked
+            card_mask = card_mask.clone()
+            card_mask[:, 0] = card_mask[:, 0] & ~all_masked.squeeze(1)
+
         board_attended = self.transformer_encoder(
             board_embedded,
             src_key_padding_mask=card_mask,

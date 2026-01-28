@@ -139,6 +139,12 @@ class SoloLearningGame(BaseNNGame):
         self.advantage_peer_normalization = self.rl_params.get(
             "advantage_peer_normalization", "zscore"
         )  # "zscore" or "center"
+
+        # Temperature annealing settings (for exploration)
+        # temperature = max(1.0, initial_temperature * temperature_decay^step)
+        self.initial_temperature = self.rl_params.get("initial_temperature", 1.0)
+        self.temperature_decay = self.rl_params.get("temperature_decay", 1.0)
+        self.current_temperature = self.initial_temperature  # will be updated each step
         # Sub-batch size for peer comparison (games within a sub-batch share the same deck shuffle)
         # If None or 0, the entire batch is one sub-batch (all games see same cards)
         self.peer_sub_batch_size = self.rl_params.get("peer_sub_batch_size", None)
@@ -484,7 +490,7 @@ class SoloLearningGame(BaseNNGame):
 
         # Model chooses which card from hand to play (mode="play")
         probabilities, index, selected_cards = player.evaluate_cards(
-            player.cards_hand, self.round_index, mode="play"
+            player.cards_hand, self.round_index, mode="play", temperature=self.current_temperature
         )
 
         # Play the selected card
@@ -523,7 +529,7 @@ class SoloLearningGame(BaseNNGame):
 
         # Model chooses which card to draft (mode="draft")
         probabilities, index, selected_cards = player.evaluate_cards(
-            river_cards, self.round_index, mode="draft"
+            river_cards, self.round_index, mode="draft", temperature=self.current_temperature
         )
 
         # Replace the used hand slot with the drafted card
@@ -598,7 +604,7 @@ class SoloLearningGame(BaseNNGame):
         # sample the cards
         possible_cards_tensor = self.decks[type][indices]  # (batch, draft_size, MainCard.length())
         probabilities, index, selected_cards = self.players[0].evaluate_cards(
-            possible_cards_tensor, self.round_index, mode=type
+            possible_cards_tensor, self.round_index, mode=type, temperature=self.current_temperature
         )
         if type == "bonus":
             # for playing a bonus card, it depends on the previous main card
@@ -680,6 +686,12 @@ class SoloLearningGame(BaseNNGame):
 
     def learning_step(self) -> None:
         batch_size = self.rl_params["train_batch_size"]
+
+        # Compute current temperature with exponential decay (clamped to minimum of 1.0)
+        # temperature = max(1.0, initial_temperature * decay^step)
+        self.current_temperature = max(
+            1.0, self.initial_temperature * (self.temperature_decay**self.step_id)
+        )
 
         # empty probas tensor for training. dim 0 is batch, but no values
         self.picked_probabilities = torch.ones(batch_size, 0, device=self.device)
@@ -812,6 +824,11 @@ class SoloLearningGame(BaseNNGame):
             )
             self.writer.add_scalar("advantage/std", advantage.std().item(), n_training_games_played)
             self.writer.add_scalar("loss/policy", loss.item(), n_training_games_played)
+            # Log temperature if using annealing
+            if self.initial_temperature > 1.0:
+                self.writer.add_scalar(
+                    "temperature/value", self.current_temperature, n_training_games_played
+                )
 
         if self.verbose > 0:
             logger.info(
@@ -885,6 +902,13 @@ def main(
     advantage_peer_normalization: Annotated[
         str, typer.Option(help="Peer-relative mode: 'zscore' or 'center'")
     ] = "zscore",
+    initial_temperature: Annotated[
+        float,
+        typer.Option(help="Initial softmax temperature for exploration (>1 = more exploration)"),
+    ] = 1.0,
+    temperature_decay: Annotated[
+        float, typer.Option(help="Temperature decay rate per step (e.g., 0.9999)")
+    ] = 1.0,
 ) -> None:
     """Run a solo learning game."""
     logger.remove()  # remove default stderr handler
@@ -941,6 +965,8 @@ def main(
         "update_baseline_rate": baseline_update_rate,
         "peer_relative_reward": peer_relative_reward,
         "advantage_peer_normalization": advantage_peer_normalization,
+        "initial_temperature": initial_temperature,
+        "temperature_decay": temperature_decay,
     }
     if grad_clip is not None:
         rl_params["grad_clip"] = grad_clip

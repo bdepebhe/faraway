@@ -74,6 +74,7 @@ class TransformersPlayer(BaseNNPlayer):
         mode: str = "play",
         games_indices: slice | range | None = None,
         return_logits: bool = False,
+        temperature: float = 1.0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Evaluate possible cards and select one using the Transformer model.
 
@@ -84,6 +85,7 @@ class TransformersPlayer(BaseNNPlayer):
             games_indices: Optional slice or indices to select specific batch elements from fields.
                            If None, uses all batch elements.
             return_logits: If True, return logits instead of probabilities as first element
+            temperature: Softmax temperature for exploration (>1 = more exploration)
 
         Returns:
             probabilities_or_logits: (batch, n_cards) - probability distribution or raw logits
@@ -111,8 +113,10 @@ class TransformersPlayer(BaseNNPlayer):
             mode=mode,
         )  # (batch, n_candidates)
 
-        # Softmax to get probabilities
-        probabilities = torch.softmax(logits, dim=1)  # (batch, n_candidates)
+        # Softmax to get probabilities (with temperature for exploration)
+        # Clamp logits for numerical stability (especially important on MPS)
+        scaled_logits = torch.clamp(logits / temperature, min=-50, max=50)
+        probabilities = torch.softmax(scaled_logits, dim=1)  # (batch, n_candidates)
 
         # Sample from the distribution (for REINFORCE)
         index = torch.multinomial(probabilities, 1)  # (batch, 1)
