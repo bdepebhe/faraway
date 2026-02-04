@@ -13,13 +13,3 @@ repos:
         additional_dependencies:
           - pydantic>=2.0
           - pytest>=8.0.0
-
-  - repo: local
-    hooks:
-      - id: coverage-badge
-        name: Update coverage badge
-        entry: bash -c 'uv run pytest --cov=faraway --cov-report=xml -q && uv run genbadge coverage -i coverage.xml -o assets/coverage-badge.svg'
-        language: system
-        pass_filenames: false
-        always_run: true
-

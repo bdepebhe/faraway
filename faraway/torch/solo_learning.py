@@ -632,17 +632,21 @@ class SoloLearningGame(BaseNNGame):
             # flush all draft_size cards
             self.deck_availability[type].scatter_(1, indices, False)
 
-        # Track discarded bonus cards (drawn but not chosen) for reshuffling
+        # Track discarded bonus cards (drawn but not chosen) for reshuffling (vectorized)
         if type == "bonus" and self.replace_remaining_cards:
-            # For batches that played a bonus card, track the non-selected cards as discarded
-            for batch_idx in batches_indices_where_card_played:
-                bid = batch_idx.item()
-                selected_idx = index[bid].item()
-                # All indices except the selected one go to the discard pile
-                batch_indices = indices[bid]  # (draft_size,)
-                mask = torch.arange(self.draft_size, device=self.device) != selected_idx
-                discarded_indices = batch_indices[mask]
-                self.bonus_discard[bid, discarded_indices] = True
+            # Batches that played a bonus: B = batches_indices_where_card_played
+            # indices[B] (n_triggered, draft_size); selected position index[B].squeeze(1)
+            B = batches_indices_where_card_played
+            n_triggered = B.shape[0]
+            if n_triggered > 0:
+                selected_pos = index[B].squeeze(1)  # (n_triggered,)
+                # mask[i, j] = True iff j != selected_pos[i]
+                discard_mask = torch.arange(self.draft_size, device=self.device).unsqueeze(
+                    0
+                ) != selected_pos.unsqueeze(1)  # (n_triggered, draft_size)
+                row_idx = B.unsqueeze(1).expand(-1, self.draft_size)[discard_mask]
+                col_idx = indices[B][discard_mask]
+                self.bonus_discard[row_idx, col_idx] = True
 
         # get the probability of the selected card
         # (1 if no card played, so log(1)=0 won't affect the loss)
