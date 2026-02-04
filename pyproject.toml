@@ -23,6 +23,9 @@ dev = [
 torch = [
     "torch>=2.0.0",
 ]
+logging = [
+    "tensorboard",
+]
 
 [build-system]
 requires = ["hatchling"]
