@@ -1,0 +1,64 @@
+# Large transformer config
+# Higher capacity model for longer training
+#
+# Usage:
+#   python -m faraway.torch.main configs/transformer_large.yaml
+
+experiment_name: "transformer_baseline_first_curriculum3"
+
+player_type: "transformer"
+n_rounds: 8
+draft_size: 10
+use_bonus_cards: true
+use_draft: false
+n_cards_hand: 3
+verbose: 2
+
+model_params:
+  embed_dim: 32
+  n_attention_heads: 8
+  n_transformer_layers: 2
+  dropout_rate: 0.1
+
+player_params:
+  use_mode_embedding: true
+
+optimizer_params:
+  lr: 0.001
+
+phases:
+  - name: "phase_1_no_draft"
+    n_steps: 250
+    initial_baseline: 29  # Start from expected random baseline
+    eval_vs_random_config:
+      every: 50
+      n_players: 1
+      n_batches: 50
+      batch_size: 64
+      initial_eval: true
+    rl_params:
+      prior_baseline_score: 29
+      train_batch_size: 128
+      update_baseline_rate: 0.02
+    optimizer_params:
+      lr: 0.0015
+
+  # Phase 2: Full draft mechanism
+  # Model learns hand management (play from hand, draft to hand)
+  - name: "phase2_with_draft"
+    n_steps: 250
+    use_draft: true
+    n_cards_hand: 3
+    load_from: "previous"  # Continue from phase 1
+    initial_baseline: "previous"  # Keep baseline from phase 1
+    rl_params:
+      train_batch_size: 128
+      update_baseline_rate: 0.02
+    optimizer_params:
+      lr: 0.001  # Lower LR for fine-tuning
+    eval_vs_random_config:
+      every: 50
+      n_players: 1
+      n_batches: 50
+      batch_size: 64
+      initial_eval: true

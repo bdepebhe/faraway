@@ -16,8 +16,10 @@ class RandomPlayer(BaseNNPlayer):
         round_index: int,
         mode: str = "play",
         games_indices: slice | range | None = None,
+        return_logits: bool = False,
+        temperature: float = 1.0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Evaluate possible cards and select one.
+        """Evaluate possible cards and select one randomly.
 
         Args:
             possible_cards_tensor: Tensor of shape (batch, n_cards, card_length)
@@ -25,15 +27,14 @@ class RandomPlayer(BaseNNPlayer):
             mode: "play", "draft", or "bonus"
             games_indices: Optional slice or indices to select specific batch elements from fields.
                            If None, uses all batch elements. Use slice(i, i+1) for single element.
+            return_logits: If True, return logits instead of probabilities as first element
+            temperature: Softmax temperature for exploration (ignored for random player)
         """
         # for random model, just use uniform logits
-        logits = (
-            torch.ones(
-                possible_cards_tensor.shape[0], possible_cards_tensor.shape[1], device=self.device
-            )
-            / possible_cards_tensor.shape[1]
+        logits = torch.zeros(
+            possible_cards_tensor.shape[0], possible_cards_tensor.shape[1], device=self.device
         )
-        # take softmax to get probabilities
+        # take softmax to get probabilities (uniform since logits are all 0)
         probabilities = torch.softmax(logits, dim=1)  # (batch, draft_size)
         # sample from probabilities
         index = torch.multinomial(probabilities, 1)  # (batch,)
@@ -45,7 +46,7 @@ class RandomPlayer(BaseNNPlayer):
             1
         )  # (batch, card_length)
         self.cards_hand_index_to_replace = index
-        return probabilities, index, selected_cards
+        return (logits if return_logits else probabilities), index, selected_cards
 
     def dump(self, path: str) -> None:
         pass

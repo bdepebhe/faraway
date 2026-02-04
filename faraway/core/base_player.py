@@ -43,6 +43,7 @@ class BasePlayer(ABC):
         round_index: int,
         mode: str = "play",
         games_indices: slice | range | None = None,
+        return_logits: bool = False,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Evaluate possible cards and select one.
 
@@ -52,6 +53,7 @@ class BasePlayer(ABC):
             mode: "play", "draft", or "bonus"
             games_indices: Optional slice or indices to select specific batch elements from fields.
                            If None, uses all batch elements. Use slice(i, i+1) for single element.
+            return_logits: If True, return logits instead of probabilities as first element.
         """
         pass
 

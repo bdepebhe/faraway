@@ -27,8 +27,8 @@ class MLPPlayer(BaseNNPlayer):
             model_params,
             n_cards_hand,
             use_bonus_cards,
-            use_cards_hand_in_state,
         )
+        self.use_cards_hand_in_state = use_cards_hand_in_state
 
         self.state_length = (
             MainCard.length() * (self.n_rounds + self.n_bonus_cards)  # previous cards
@@ -52,7 +52,7 @@ class MLPPlayer(BaseNNPlayer):
             )
 
     def reset_model(self) -> None:
-        self.model = create_mlp_model(self.nn_input_size, **self.model_params)
+        self.model = create_mlp_model(self.nn_input_size, **self.model_params).to(self.device)
 
     def evaluate_cards(
         self,
@@ -60,6 +60,8 @@ class MLPPlayer(BaseNNPlayer):
         round_index: int,
         mode: str = "play",
         games_indices: slice | range | None = None,
+        return_logits: bool = False,
+        temperature: float = 1.0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Evaluate possible cards and select one.
 
@@ -69,6 +71,8 @@ class MLPPlayer(BaseNNPlayer):
             mode: "play", "draft", or "bonus"
             games_indices: Optional slice or indices to select specific batch elements from fields.
                            If None, uses all batch elements. Use slice(i, i+1) for single element.
+            return_logits: If True, return logits instead of probabilities as first element
+            temperature: Softmax temperature for exploration (>1 = more exploration)
         """
         if games_indices is None:
             games_indices = slice(None)
@@ -96,8 +100,8 @@ class MLPPlayer(BaseNNPlayer):
         )  # (batch, draft_size, (8+6)*24 + 1 + MainCard.length())
         # pass the input tensor through the model
         logits = self.model(input_tensor).squeeze(dim=2)  # (batch, draft_size)
-        # take softmax to get probabilities
-        probabilities = torch.softmax(logits, dim=1)  # (batch, draft_size)
+        # take softmax to get probabilities (with temperature for exploration)
+        probabilities = torch.softmax(logits / temperature, dim=1)  # (batch, draft_size)
         # sample from probabilities
         index = torch.multinomial(probabilities, 1)  # (batch,)
         # add the played card to the main field
@@ -108,7 +112,7 @@ class MLPPlayer(BaseNNPlayer):
             1
         )  # (batch, card_length)
         self.cards_hand_index_to_replace = index
-        return probabilities, index, selected_cards
+        return (logits if return_logits else probabilities), index, selected_cards
 
     def dump(self, path: str) -> None:
         """Save the player (model + config) to a single file."""

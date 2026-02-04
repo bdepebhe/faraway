@@ -53,15 +53,23 @@ def play_vs_random(
     else:
         game.writer = writer
 
-    wins, mean_scores = game.run_tournament(n_batches=n_eval_batches, batch_size=batch_size)
+    wins, mean_scores, mean_bonus_cards, mean_draft_priority = game.run_tournament(
+        n_batches=n_eval_batches, batch_size=batch_size
+    )
     step = player.n_training_games_played
 
     win_rate = wins[0] / (n_eval_batches * batch_size)
     mean_score = mean_scores[0]
+    mean_bonus = mean_bonus_cards[0]
+    draft_priority = mean_draft_priority[0]
 
     if game.writer is not None:
         game.writer.add_scalar(f"eval/vs_{n_random_players}_random/win_rate", win_rate, step)
         game.writer.add_scalar(f"eval/vs_{n_random_players}_random/mean_score", mean_score, step)
+        game.writer.add_scalar(f"eval/vs_{n_random_players}_random/mean_bonus", mean_bonus, step)
+        game.writer.add_scalar(
+            f"eval/vs_{n_random_players}_random/draft_priority_rate", draft_priority, step
+        )
         game.writer.flush()
 
     # Only close if we created the writer

@@ -1,0 +1,50 @@
+# Large transformer config
+# Higher capacity model for longer training
+#
+# Usage:
+#   python -m faraway.torch.main configs/transformer_large.yaml
+
+experiment_name: "transfo_peer_relative2"
+
+player_type: "transformer"
+n_rounds: 8
+draft_size: 3
+use_bonus_cards: true
+use_hand: true
+n_cards_hand: 3
+verbose: 2
+
+model_params:
+  embed_dim: 64
+  n_attention_heads: 4
+  n_transformer_layers: 3
+  dropout_rate: 0.1
+
+optimizer_params:
+  lr: 0.001
+
+player_params:
+  use_mode_embedding: true
+
+phases:
+  - name: "main_training"
+    n_steps: 15000
+    eval_vs_random_config:
+      every: 200
+      n_players: 1
+      n_batches: 50
+      batch_size: 64
+      initial_eval: true
+    eval_solo_config:
+      every: 200
+      n_batches: 50
+      batch_size: 64
+      initial_eval: true
+    rl_params:
+      train_batch_size: 128
+      update_baseline_rate: 0.02
+      peer_relative_reward: true
+      advantage_peer_normalization: "center"
+      peer_sub_batch_size: 16
+    optimizer_params:
+      lr: 0.0001

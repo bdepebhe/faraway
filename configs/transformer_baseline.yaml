@@ -1,0 +1,48 @@
+# Large transformer config
+# Higher capacity model for longer training
+#
+# Usage:
+#   python -m faraway.torch.main configs/transformer_large.yaml
+
+experiment_name: "transformer_baseline_repro"
+
+player_type: "transformer"
+n_rounds: 8
+draft_size: 10
+use_bonus_cards: true
+use_draft: false
+n_cards_hand: 3
+verbose: 2
+
+model_params:
+  embed_dim: 32
+  n_attention_heads: 8
+  n_transformer_layers: 2
+  dropout_rate: 0.1
+
+player_params:
+  use_mode_embedding: true
+
+optimizer_params:
+  lr: 0.001
+
+phases:
+  - name: "main_training"
+    n_steps: 500
+    eval_vs_random_config:
+      every: 100
+      n_players: 1
+      n_batches: 50
+      batch_size: 64
+      initial_eval: true
+    eval_solo_config:
+      every: 100
+      n_batches: 50
+      batch_size: 64
+      initial_eval: true
+    rl_params:
+      prior_baseline_score: 29
+      train_batch_size: 128
+      update_baseline_rate: 0.02
+    optimizer_params:
+      lr: 0.001

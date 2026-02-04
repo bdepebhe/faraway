@@ -16,12 +16,14 @@ class BaseNNPlayer(BasePlayer):
         model_params: dict[str, Any] | None = None,
         n_cards_hand: int = 3,
         use_bonus_cards: bool = True,
-        use_cards_hand_in_state: bool = False,
     ):
         super().__init__(n_rounds, n_cards_hand, use_bonus_cards)
-        self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-        self.use_cards_hand_in_state = use_cards_hand_in_state
+        if device is not None:
+            self.device = device
+        elif torch.cuda.is_available():
+            self.device = torch.device("cuda")
+        else:
+            self.device = torch.device("cpu")
 
         self.model_params = model_params or {}
 
@@ -40,8 +42,8 @@ class BaseNNPlayer(BasePlayer):
     def reset_games_batch(self, batch_size: int) -> None:
         super().reset_games_batch(batch_size)
         self.fields = {
-            "main": torch.Tensor(self.fields["main"], device=self.device),
-            "bonus": torch.Tensor(self.fields["bonus"], device=self.device),
+            "main": torch.tensor(self.fields["main"], dtype=torch.float32, device=self.device),
+            "bonus": torch.tensor(self.fields["bonus"], dtype=torch.float32, device=self.device),
         }
 
     @abstractmethod
@@ -51,7 +53,22 @@ class BaseNNPlayer(BasePlayer):
         round_index: int,
         mode: str = "play",
         games_indices: slice | range | None = None,
+        return_logits: bool = False,
+        temperature: float = 1.0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Evaluate candidate cards and select one.
+
+        Args:
+            possible_cards_tensor: (batch, n_cards, card_length) candidate cards
+            round_index: Current round index
+            mode: "play", "draft", or "bonus"
+            games_indices: Optional slice to select specific batch elements
+            return_logits: If True, return logits instead of probabilities as first element
+            temperature: Softmax temperature for exploration (>1 = more exploration)
+
+        Returns:
+            (probabilities_or_logits, selected_index, selected_cards)
+        """
         pass
 
     def play_main_card(self, selected_cards: torch.Tensor, round_index: int) -> None:

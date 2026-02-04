@@ -1,0 +1,48 @@
+# Large transformer config
+# Higher capacity model for longer training
+#
+# Usage:
+#   python -m faraway.torch.main configs/transformer_large.yaml
+
+experiment_name: "mlp_high_temp"
+
+player_type: "mlp"
+n_rounds: 8
+draft_size: 3
+use_bonus_cards: true
+use_hand: true
+n_cards_hand: 3
+verbose: 2
+
+model_params:
+  dropout_rate: 0.1
+
+player_params:
+  use_cards_hand_in_state: false
+  use_draft_indicator_in_model_input: false
+
+optimizer_params:
+  lr: 0.001
+
+phases:
+  - name: "main_training"
+    n_steps: 10000
+    eval_vs_random_config:
+      every: 100
+      n_players: 1
+      n_batches: 50
+      batch_size: 64
+      initial_eval: true
+    eval_solo_config:
+      every: 100
+      n_batches: 50
+      batch_size: 64
+      initial_eval: true
+    rl_params:
+      train_batch_size: 128
+      update_baseline_rate: 0.02
+      initial_temperature: 10.0
+      temperature_decay: 0.99999999
+      peer_relative_reward: false
+    optimizer_params:
+      lr: 0.0005
