@@ -19,6 +19,7 @@ import typer
 from loguru import logger
 
 from faraway.torch.base_game import BaseNNGame
+from faraway.torch.env import BatchedFarawayEnv
 from faraway.torch.mlp_player import MLPPlayer
 from faraway.torch.nn_player import BaseNNPlayer
 from faraway.torch.play_vs_random import play_vs_random
@@ -154,6 +155,19 @@ class SoloLearningGame(BaseNNGame):
         self.eval_vs_random_config = eval_vs_random_config or {}
         self.eval_solo_config = eval_solo_config or {}
 
+        # Common batched environment (Phase B refactor)
+        self._env = BatchedFarawayEnv(
+            n_rounds=self.n_rounds,
+            use_bonus_cards=self.use_bonus_cards,
+            draft_size=self.draft_size,
+            use_hand=self.use_hand,
+            n_cards_hand=self.n_cards_hand,
+            replace_remaining_cards=self.replace_remaining_cards,
+            device=self.device,
+            peer_relative_reward=self.peer_relative_reward,
+            peer_sub_batch_size=self.peer_sub_batch_size,
+            verbose=self.verbose,
+        )
         # Initialize TensorBoard (uses base class method)
         self.init_tensorboard()
         self.reset_learning(model_path=model_path)
@@ -194,49 +208,22 @@ class SoloLearningGame(BaseNNGame):
         )
 
     def reset_games_batch(self, batch_size: int) -> None:
-        """Reset games and initialize player hands if using draft mode."""
-        super().reset_games_batch(batch_size)
+        """Reset games and initialize player hands via common env."""
+        self._env.reset(batch_size, self.players)
+        self.deck_availability = self._env.deck_availability
+        self.bonus_discard = self._env.bonus_discard
+        self.round_index = self._env.round_index
+        # Sync peer-relative state for advantage computation in learning_step
+        self.n_sub_batches = self._env.n_sub_batches
+        self.current_sub_batch_size = self._env.current_sub_batch_size
 
-        if self.peer_relative_reward:
-            # Pre-shuffle decks for peer comparison: games in same sub-batch see same cards
-            self._setup_fixed_seed_decks(batch_size)
+    def get_scores(self) -> torch.Tensor:
+        """Compute final scores via common env."""
+        return self._env.get_scores(self.players)
 
-            if self.use_hand:
-                # Deal same initial hand to games within each sub-batch
-                self._deal_initial_hands_fixed_seed(
-                    n_cards=self.n_cards_hand, batch_size=batch_size
-                )
-        elif self.use_hand:
-            # Deal random initial hands (legacy behavior)
-            self.deal_initial_hands(n_cards=self.n_cards_hand, batch_size=batch_size)
-
-    def _setup_fixed_seed_decks(self, batch_size: int) -> None:
-        """Pre-shuffle decks for peer-relative reward (fixed seed within sub-batches).
-
-        Games within the same sub-batch see the same cards in the same order.
-        Different sub-batches get different deck shuffles for diversity.
-        """
-        # Determine number of sub-batches
-        sub_batch_size = self.peer_sub_batch_size or batch_size
-        self.n_sub_batches = (batch_size + sub_batch_size - 1) // sub_batch_size  # ceil division
-        self.current_sub_batch_size = sub_batch_size
-
-        # Create master deck orderings for each sub-batch
-        self.master_deck_orders = {
-            "main": [
-                torch.randperm(self.decks["main"].shape[0], device=self.device)
-                for _ in range(self.n_sub_batches)
-            ],
-            "bonus": [
-                torch.randperm(self.decks["bonus"].shape[0], device=self.device)
-                for _ in range(self.n_sub_batches)
-            ],
-        }
-        # Track position in the master order for sequential dealing (per sub-batch)
-        self.deck_cursors = {
-            "main": [0] * self.n_sub_batches,
-            "bonus": [0] * self.n_sub_batches,
-        }
+    def get_bonus_cards_played(self) -> torch.Tensor:
+        """Count bonus cards played per player via common env."""
+        return self._env.get_bonus_cards_played(self.players)
 
     def _compute_peer_relative_advantage(self, shaped_reward: torch.Tensor) -> torch.Tensor:
         """Compute advantage by normalizing within each sub-batch.
@@ -295,41 +282,6 @@ class SoloLearningGame(BaseNNGame):
         advantage = normalized.view(-1)[:batch_size]
 
         return advantage
-
-    def _deal_initial_hands_fixed_seed(self, n_cards: int, batch_size: int) -> None:
-        """Deal initial hands with fixed seed: games in same sub-batch get the same hand."""
-        player = self.players[0]
-        card_length = self.decks["main"].shape[1]
-        expanded_main_deck = self.decks["main"].unsqueeze(0).expand(batch_size, -1, -1)
-
-        # Vectorized: all games in same sub-batch get same cards
-        # Stack all deck orders: (n_sub_batches, deck_size)
-        stacked_orders = torch.stack(self.master_deck_orders["main"])
-
-        # Get cursor (same for all sub-batches)
-        cursor = self.deck_cursors["main"][0]
-
-        # Get indices for each sub-batch: (n_sub_batches, n_cards)
-        sub_batch_indices = stacked_orders[:, cursor : cursor + n_cards]
-
-        # Compute sub-batch ID for each game: (batch_size,)
-        sub_batch_ids = torch.arange(batch_size, device=self.device) // self.current_sub_batch_size
-
-        # Index to get indices for each game: (batch_size, n_cards)
-        indices = sub_batch_indices[sub_batch_ids]
-
-        # Update all cursors
-        for i in range(self.n_sub_batches):
-            self.deck_cursors["main"][i] += n_cards
-
-        # Expand indices for gather: (batch, n_cards) -> (batch, n_cards, card_length)
-        indices_expanded = indices.unsqueeze(2).expand(-1, -1, card_length)
-
-        # Gather cards: (batch, deck_size, card_length) -> (batch, n_cards, card_length)
-        player.cards_hand = torch.gather(expanded_main_deck, 1, indices_expanded)
-
-        # Mark these cards as unavailable in the deck
-        self.deck_availability["main"].scatter_(1, indices, False)
 
     def dump_model(self, model_path: str) -> None:
         torch.save(self.players[0].model, model_path)
@@ -481,212 +433,13 @@ class SoloLearningGame(BaseNNGame):
             hparams_text = "\n".join(f"**{k}**: {v}" for k, v in hparams.items())
             self.writer.add_text("hparams", hparams_text, 0)
 
-    def _play_from_hand(self) -> torch.Tensor:
-        """Choose and play a card from hand. Returns probability of the selection.
-
-        Used when use_hand=True. The model selects one card from the hand to play.
-        """
-        player = self.players[0]
-
-        # Model chooses which card from hand to play (mode="play")
-        probabilities, index, selected_cards = player.evaluate_cards(
-            player.cards_hand, self.round_index, mode="play", temperature=self.current_temperature
-        )
-
-        # Play the selected card
-        player.play_main_card(selected_cards, self.round_index)
-
-        # Store which hand slot was used (for replacement in _draft_to_hand)
-        self.hand_slot_to_replace = index.squeeze(1)  # (batch,)
-
-        # Get the probability of the selected card
-        probability = torch.gather(probabilities, 1, index).squeeze(1)  # (batch,)
-        return probability
-
-    def _draft_to_hand(self) -> torch.Tensor:
-        """Draft a card from the river to replace the played card in hand.
-
-        Used when use_hand=True. The model selects one card from the river to add to hand.
-        """
-        player = self.players[0]
-        batch_size = player.get_current_batch_size()
-
-        # With peer_relative_reward and appropriate deck/draft sizes, deck won't be exhausted
-        if not self.peer_relative_reward:
-            # Check if there are enough cards in the deck (only needed for non-peer mode)
-            available_counts = self.deck_availability["main"].sum(dim=1)  # (batch,)
-            can_draft = available_counts >= self.draft_size
-
-            if not can_draft.any():
-                # No drafting possible (late game), return prob=1 (no decision)
-                return torch.ones(batch_size, device=self.device)
-
-        # Sample cards from the deck for the river
-        indices = self._sample_draft_indices("main", batch_size)  # (batch, draft_size)
-
-        # Get the actual card tensors
-        river_cards = self.decks["main"][indices]  # (batch, draft_size, card_dim)
-
-        # Model chooses which card to draft (mode="draft")
-        probabilities, index, selected_cards = player.evaluate_cards(
-            river_cards, self.round_index, mode="draft", temperature=self.current_temperature
-        )
-
-        # Replace the used hand slot with the drafted card
-        batch_indices = torch.arange(batch_size, device=self.device)
-        player.cards_hand[batch_indices, self.hand_slot_to_replace, :] = selected_cards
-
-        # Mark the drafted card as unavailable
-        selected_deck_indices = torch.gather(indices, 1, index).squeeze(1)  # (batch,)
-        self.deck_availability["main"][batch_indices, selected_deck_indices] = False
-
-        # Get probability
-        probability = torch.gather(probabilities, 1, index).squeeze(1)  # (batch,)
-        return probability
-
-    def _sample_draft_indices(self, deck_type: str, batch_size: int) -> torch.Tensor:
-        """Sample draft indices from deck, using sequential dealing if peer_relative_reward.
-
-        Args:
-            deck_type: "main" or "bonus"
-            batch_size: Number of games in batch
-
-        Returns:
-            Tensor of shape (batch, draft_size) with card indices
-        """
-        if self.peer_relative_reward:
-            # Vectorized: all games in same sub-batch see same cards
-            # Stack all deck orders: (n_sub_batches, deck_size)
-            stacked_orders = torch.stack(self.master_deck_orders[deck_type])
-
-            # Get cursor (same for all sub-batches)
-            cursor = self.deck_cursors[deck_type][0]
-
-            # Get indices for each sub-batch: (n_sub_batches, draft_size)
-            sub_batch_indices = stacked_orders[:, cursor : cursor + self.draft_size]
-
-            # Compute sub-batch ID for each game: (batch_size,)
-            sub_batch_ids = (
-                torch.arange(batch_size, device=self.device) // self.current_sub_batch_size
-            )
-
-            # Index to get indices for each game: (batch_size, draft_size)
-            indices = sub_batch_indices[sub_batch_ids]
-
-            # Update all cursors
-            for i in range(self.n_sub_batches):
-                self.deck_cursors[deck_type][i] += self.draft_size
-        else:
-            # Random sampling (original behavior)
-            indices = torch.multinomial(
-                self.deck_availability[deck_type].float(), self.draft_size, replacement=False
-            )
-        return indices  # (batch, draft_size)
-
-    def _play_card(self, type: str) -> torch.Tensor:
-        """Play a card of the given type (main or bonus).
-
-        For main cards with use_hand=False: samples from deck and plays directly.
-        For main cards with use_hand=True: handled by _play_from_hand/_draft_to_hand.
-        For bonus cards: always samples from bonus deck.
-        """
-        batch_size = self.players[0].get_current_batch_size()
-
-        # For bonus cards, check if we need to reshuffle discarded cards
-        # Per official rules: "If the Sanctuary deck is empty, shuffle the
-        # discarded Sanctuary cards to form a new deck."
-        # (Skipped when peer_relative_reward as deck is pre-shuffled and sized appropriately)
-        if type == "bonus" and not self.peer_relative_reward:
-            self.reshuffle_bonus_discard_if_needed(n_cards_needed=self.draft_size)
-
-        # select indices of cards to sample from the deck
-        indices = self._sample_draft_indices(type, batch_size)  # (batch, draft_size)
-        # sample the cards
-        possible_cards_tensor = self.decks[type][indices]  # (batch, draft_size, MainCard.length())
-        probabilities, index, selected_cards = self.players[0].evaluate_cards(
-            possible_cards_tensor, self.round_index, mode=type, temperature=self.current_temperature
-        )
-        if type == "bonus":
-            # for playing a bonus card, it depends on the previous main card
-            batches_indices_where_card_played = torch.where(
-                self.players[0].fields["main"][:, self.round_index, 0]
-                > self.players[0].fields["main"][:, self.round_index - 1, 0]
-            )[0]
-            self.players[0].fields[type][
-                batches_indices_where_card_played, self.round_index - 1, :
-            ] = selected_cards[batches_indices_where_card_played]
-        elif type == "main":
-            # all batches play a main card every round
-            batches_indices_where_card_played = torch.arange(batch_size, device=self.device)
-            self.players[0].play_main_card(selected_cards, self.round_index)
-
-        # update availability tensor
-        if self.replace_remaining_cards:
-            # only switch the played card to 0
-            selected_card_indices = torch.gather(indices, 1, index).squeeze(1)  # (batch,)
-            self.deck_availability[type][
-                batches_indices_where_card_played,
-                selected_card_indices[batches_indices_where_card_played],
-            ] = False
-        else:
-            # flush all draft_size cards
-            self.deck_availability[type].scatter_(1, indices, False)
-
-        # Track discarded bonus cards (drawn but not chosen) for reshuffling (vectorized)
-        if type == "bonus" and self.replace_remaining_cards:
-            # Batches that played a bonus: B = batches_indices_where_card_played
-            # indices[B] (n_triggered, draft_size); selected position index[B].squeeze(1)
-            B = batches_indices_where_card_played
-            n_triggered = B.shape[0]
-            if n_triggered > 0:
-                selected_pos = index[B].squeeze(1)  # (n_triggered,)
-                # mask[i, j] = True iff j != selected_pos[i]
-                discard_mask = torch.arange(self.draft_size, device=self.device).unsqueeze(
-                    0
-                ) != selected_pos.unsqueeze(1)  # (n_triggered, draft_size)
-                row_idx = B.unsqueeze(1).expand(-1, self.draft_size)[discard_mask]
-                col_idx = indices[B][discard_mask]
-                self.bonus_discard[row_idx, col_idx] = True
-
-        # get the probability of the selected card
-        # (1 if no card played, so log(1)=0 won't affect the loss)
-        probability = torch.ones(batch_size, device=self.device)
-        probability[batches_indices_where_card_played] = torch.gather(
-            probabilities, 1, index
-        ).squeeze(1)[batches_indices_where_card_played]  # (batch,)
-        return probability
-
     def play_round(self) -> torch.Tensor:
-        """Play one round: play a main card, optionally draft, optionally play bonus.
-
-        Returns probabilities of all decisions made this round.
-        """
-        probabilities_list: list[torch.Tensor] = []
-
-        if self.use_hand:
-            # Draft mode: play from hand, then draft to refill hand
-            picked_probability_play = self._play_from_hand()
-            probabilities_list.append(picked_probability_play)
-
-            # Draft a new card to hand (if cards remain in deck)
-            picked_probability_draft = self._draft_to_hand()
-            probabilities_list.append(picked_probability_draft)
-        else:
-            # No draft: pick directly from deck (legacy behavior)
-            picked_probability_main = self._play_card("main")
-            probabilities_list.append(picked_probability_main)
-
-        # Play bonus card (if applicable)
-        if self.use_bonus_cards and self.round_index > 0:
-            picked_probability_bonus = self._play_card("bonus")
-            probabilities_list.append(picked_probability_bonus)
-
-        # Increment round index
-        self.round_index += 1
-
-        # Stack all probabilities
-        picked_probabilities = torch.stack(probabilities_list, dim=1)  # (batch, n_decisions)
-        return picked_probabilities
+        """Play one round via common env. Returns probabilities of all decisions this round."""
+        result = self._env.step_round(self.players, temperature=self.current_temperature)
+        self.deck_availability = self._env.deck_availability
+        self.bonus_discard = self._env.bonus_discard
+        self.round_index = self._env.round_index
+        return result.picked_probabilities[0]
 
     def learning_step(self) -> None:
         batch_size = self.rl_params["train_batch_size"]

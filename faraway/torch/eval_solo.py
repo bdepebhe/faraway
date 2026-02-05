@@ -75,7 +75,9 @@ def main() -> None:
 
     for _ in range(args.n_batches):
         game.reset_games_batch(batch_size=args.batch_size)
-        game.deal_initial_hands()
+        # When use_hand, env already dealt in reset; otherwise we need to deal
+        if not args.use_hand:
+            game.deal_initial_hands()
 
         for _ in range(n_rounds):
             game.play_round()
