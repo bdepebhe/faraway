@@ -21,8 +21,8 @@ import typer
 import yaml  # type: ignore[import-untyped]
 from loguru import logger
 
+from faraway.torch.learning_runner import LearningRunner
 from faraway.torch.mlp_player import MLPPlayer
-from faraway.torch.solo_learning import SoloLearningGame
 from faraway.torch.transformers_player import TransformersPlayer
 
 
@@ -214,8 +214,8 @@ def run_phase(
     if load_from:
         logger.info(f"Loading from: {load_from}")
 
-    # Create the game
-    game = SoloLearningGame(
+    # Create the runner (default setting = solo)
+    game = LearningRunner(
         n_rounds=n_rounds,
         draft_size=draft_size,
         use_hand=use_hand,

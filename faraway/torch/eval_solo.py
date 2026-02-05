@@ -6,7 +6,7 @@ from typing import Any
 import torch
 from loguru import logger
 
-from faraway.torch.solo_learning import SoloLearningGame
+from faraway.torch.learning_runner import LearningRunner
 
 
 def main() -> None:
@@ -53,8 +53,8 @@ def main() -> None:
 
     model_params = checkpoint.get("model_params", {})
 
-    # Create game with the loaded configuration
-    game = SoloLearningGame(
+    # Create runner with the loaded configuration (default solo setting)
+    game = LearningRunner(
         n_rounds=n_rounds,
         draft_size=args.draft_size,
         use_bonus_cards=use_bonus_cards,

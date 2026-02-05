@@ -20,7 +20,7 @@ class BaselineEMA:
         self.baseline = prior_baseline
         self.update_rate = update_rate
 
-    def compute(self, reward: torch.Tensor) -> torch.Tensor:
+    def compute(self, reward: torch.Tensor, **kwargs: object) -> torch.Tensor:
         """Return advantage = reward - baseline (no in-place update)."""
         return reward - self.baseline
 
@@ -74,7 +74,7 @@ def _peer_relative_advantage(
     else:
         normalized = reshaped - sub_means
 
-    advantage = normalized.view(-1)[:batch_size]
+    advantage: torch.Tensor = normalized.view(-1)[:batch_size]
     return advantage
 
 
@@ -100,3 +100,40 @@ class PeerRelativeCenter:
         current_sub_batch_size: int,
     ) -> torch.Tensor:
         return _peer_relative_advantage(reward, n_sub_batches, current_sub_batch_size, "center")
+
+
+class AdvantageWithBaselineTracking:
+    """Single advantage object for the trainer: compute (delegate) + update (always baseline EMA).
+
+    Use when advantage for loss is peer-relative but baseline is still tracked for logging.
+    compute_strategy: BaselineEMA (compute+update) or PeerRelative* (compute only).
+    baseline_ema: always used for update(reward); also for compute when strategy is baseline.
+    """
+
+    def __init__(
+        self,
+        compute_strategy: BaselineEMA | PeerRelativeZScore | PeerRelativeCenter,
+        baseline_ema: BaselineEMA,
+    ) -> None:
+        self._compute_strategy = compute_strategy
+        self._baseline_ema = baseline_ema
+
+    @property
+    def baseline(self) -> float:
+        return self._baseline_ema.baseline
+
+    def compute(self, reward: torch.Tensor, **kwargs: object) -> torch.Tensor:
+        n_sub = kwargs.get("n_sub_batches")
+        cur_sub = kwargs.get("current_sub_batch_size")
+        if (
+            isinstance(self._compute_strategy, PeerRelativeZScore | PeerRelativeCenter)
+            and isinstance(n_sub, int)
+            and isinstance(cur_sub, int)
+        ):
+            return self._compute_strategy.compute(reward, n_sub, cur_sub)
+        # Else: baseline mode (no env_state); only BaselineEMA has compute(reward).
+        assert isinstance(self._compute_strategy, BaselineEMA)
+        return self._compute_strategy.compute(reward)
+
+    def update(self, reward: torch.Tensor) -> None:
+        self._baseline_ema.update(reward)
