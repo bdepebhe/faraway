@@ -24,6 +24,7 @@ from faraway.torch.learning import (
     BaselineEMA,
     PeerRelativeCenter,
     PeerRelativeZScore,
+    ReinforceAlgorithm,
     run_rollout,
 )
 from faraway.torch.mlp_player import MLPPlayer
@@ -166,6 +167,8 @@ class SoloLearningGame(BaseNNGame):
         # Peer-relative advantage (only used when peer_relative_reward=True)
         norm = self.advantage_peer_normalization
         self._advantage_peer = PeerRelativeZScore() if norm == "zscore" else PeerRelativeCenter()
+        # Algorithm: REINFORCE (loss from log_probs + advantage; optional grad clip)
+        self._algorithm = ReinforceAlgorithm(grad_clip=self.rl_params.get("grad_clip"))
 
         # Evaluation config
         self.eval_vs_random_config = eval_vs_random_config or {}
@@ -473,15 +476,12 @@ class SoloLearningGame(BaseNNGame):
         else:
             advantage = self._baseline_ema.compute(shaped_reward)
 
-        loss = (-torch.sum(log_probs, 1) * advantage).mean()  # scalar
+        loss = self._algorithm.compute_loss(log_probs, advantage)
         self.optimizer.zero_grad()
         loss.backward()
-        # Gradient clipping for stability (especially with mode embedding)
-        if self.rl_params.get("grad_clip", None) is not None:
-            torch.nn.utils.clip_grad_norm_(
-                self.players[0].model.parameters(), self.rl_params["grad_clip"]
-            )
+        self._algorithm.clip_grad_if_needed(self.players[0].model.parameters())
         self.optimizer.step()
+        self._algorithm.update_after_step()
 
         # Update total games played (epoch metric based on environment interactions)
         self.players[0].n_training_games_played += self.rl_params["train_batch_size"]
