@@ -20,6 +20,12 @@ from loguru import logger
 
 from faraway.torch.base_game import BaseNNGame
 from faraway.torch.env import BatchedFarawayEnv
+from faraway.torch.learning import (
+    BaselineEMA,
+    PeerRelativeCenter,
+    PeerRelativeZScore,
+    run_rollout,
+)
 from faraway.torch.mlp_player import MLPPlayer
 from faraway.torch.nn_player import BaseNNPlayer
 from faraway.torch.play_vs_random import play_vs_random
@@ -151,6 +157,16 @@ class SoloLearningGame(BaseNNGame):
         self.peer_sub_batch_size = self.rl_params.get("peer_sub_batch_size", None)
         self.player_params["use_bonus_cards"] = self.use_bonus_cards
 
+        # Advantage: baseline EMA (always used for tracking; also for adv when not peer-relative)
+        self._baseline_ema = BaselineEMA(
+            prior_baseline=self.rl_params["prior_baseline_score"],
+            update_rate=self.rl_params["update_baseline_rate"],
+        )
+        self.baseline = self._baseline_ema.baseline
+        # Peer-relative advantage (only used when peer_relative_reward=True)
+        norm = self.advantage_peer_normalization
+        self._advantage_peer = PeerRelativeZScore() if norm == "zscore" else PeerRelativeCenter()
+
         # Evaluation config
         self.eval_vs_random_config = eval_vs_random_config or {}
         self.eval_solo_config = eval_solo_config or {}
@@ -178,7 +194,8 @@ class SoloLearningGame(BaseNNGame):
             model = torch.load(model_path)
         else:
             model = None
-        self.baseline = self.rl_params["prior_baseline_score"]
+        self._baseline_ema.baseline = self.rl_params["prior_baseline_score"]
+        self.baseline = self._baseline_ema.baseline
         self.step_id = 0  # step counter for evaluation frequency (session-local, not saved)
 
         if self.player_type == "mlp":
@@ -213,9 +230,6 @@ class SoloLearningGame(BaseNNGame):
         self.deck_availability = self._env.deck_availability
         self.bonus_discard = self._env.bonus_discard
         self.round_index = self._env.round_index
-        # Sync peer-relative state for advantage computation in learning_step
-        self.n_sub_batches = self._env.n_sub_batches
-        self.current_sub_batch_size = self._env.current_sub_batch_size
 
     def get_scores(self) -> torch.Tensor:
         """Compute final scores via common env."""
@@ -224,64 +238,6 @@ class SoloLearningGame(BaseNNGame):
     def get_bonus_cards_played(self) -> torch.Tensor:
         """Count bonus cards played per player via common env."""
         return self._env.get_bonus_cards_played(self.players)
-
-    def _compute_peer_relative_advantage(self, shaped_reward: torch.Tensor) -> torch.Tensor:
-        """Compute advantage by normalizing within each sub-batch.
-
-        Games in the same sub-batch faced identical cards, so their scores can be
-        fairly compared. Normalization (z-score or centering) is done per sub-batch.
-
-        Args:
-            shaped_reward: Tensor of shape (batch,) with (shaped) rewards
-
-        Returns:
-            Tensor of shape (batch,) with peer-relative advantages
-        """
-        batch_size = shaped_reward.shape[0]
-
-        # Reshape to (n_sub_batches, sub_batch_size) for vectorized normalization
-        # Pad if batch_size is not evenly divisible
-        padded_size = self.n_sub_batches * self.current_sub_batch_size
-        if batch_size < padded_size:
-            # Pad with zeros (won't affect mean/std of real data)
-            padded_rewards = torch.zeros(padded_size, device=shaped_reward.device)
-            padded_rewards[:batch_size] = shaped_reward
-            reshaped = padded_rewards.view(self.n_sub_batches, self.current_sub_batch_size)
-            # Create mask for valid entries
-            valid_mask = torch.zeros(padded_size, dtype=torch.bool, device=shaped_reward.device)
-            valid_mask[:batch_size] = True
-            valid_mask = valid_mask.view(self.n_sub_batches, self.current_sub_batch_size)
-        else:
-            reshaped = shaped_reward.view(self.n_sub_batches, self.current_sub_batch_size)
-            valid_mask = None
-
-        # Compute mean per sub-batch: (n_sub_batches, 1)
-        if valid_mask is not None:
-            # Handle partial last sub-batch
-            sub_means = (reshaped * valid_mask).sum(dim=1, keepdim=True) / valid_mask.sum(
-                dim=1, keepdim=True
-            ).clamp(min=1)
-        else:
-            sub_means = reshaped.mean(dim=1, keepdim=True)
-
-        if self.advantage_peer_normalization == "zscore":
-            # Compute std per sub-batch
-            centered = reshaped - sub_means
-            if valid_mask is not None:
-                sub_stds = (
-                    (centered**2 * valid_mask).sum(dim=1, keepdim=True)
-                    / valid_mask.sum(dim=1, keepdim=True).clamp(min=1)
-                ).sqrt()
-            else:
-                sub_stds = reshaped.std(dim=1, keepdim=True)
-            normalized = centered / (sub_stds + 1e-8)
-        else:  # "center"
-            normalized = reshaped - sub_means
-
-        # Flatten and trim to original batch_size
-        advantage = normalized.view(-1)[:batch_size]
-
-        return advantage
 
     def dump_model(self, model_path: str) -> None:
         torch.save(self.players[0].model, model_path)
@@ -315,7 +271,8 @@ class SoloLearningGame(BaseNNGame):
         self.players[0].model.load_state_dict(checkpoint["player_state"])
         self.players[0].n_training_games_played = checkpoint.get("n_training_games_played", 0)
         if "baseline" in checkpoint:
-            self.baseline = checkpoint["baseline"]
+            self._baseline_ema.baseline = checkpoint["baseline"]
+            self.baseline = self._baseline_ema.baseline
             logger.info(f"Restored baseline: {self.baseline:.2f}")
         logger.info(f"Restored n_training_games_played: {self.players[0].n_training_games_played}")
 
@@ -445,18 +402,20 @@ class SoloLearningGame(BaseNNGame):
         batch_size = self.rl_params["train_batch_size"]
 
         # Compute current temperature with exponential decay (clamped to minimum of 1.0)
-        # temperature = max(1.0, initial_temperature * decay^step)
         self.current_temperature = max(
             1.0, self.initial_temperature * (self.temperature_decay**self.step_id)
         )
 
-        # empty probas tensor for training. dim 0 is batch, but no values
-        self.picked_probabilities = torch.ones(batch_size, 0, device=self.device)
-        # play the game and get the log probabilities
-        self.play_games_batch(batch_size, learning_mode=True)
-        log_probs = torch.log(self.picked_probabilities)  # (batch, n_rounds)
-        # apply final_count_from_tensor_field for each element of the batch
-        scores = self.get_scores()[:, 0]
+        # Rollout: run env for one batch; collect log-probs and scores
+        result = run_rollout(
+            self._env,
+            self.players,
+            learner_index=0,
+            temperature=self.current_temperature,
+            batch_size=batch_size,
+        )
+        log_probs = result.log_probs_learner  # (batch, n_decisions)
+        scores = result.scores[:, 0]
 
         # Reward shaping: Count how many times the model played increasing IDs
         # This directly rewards the BEHAVIOR that leads to bonus cards, not the
@@ -504,15 +463,15 @@ class SoloLearningGame(BaseNNGame):
             low_id_normalized = (mid_card_id - avg_card_id) / mid_card_id
             shaped_reward = shaped_reward + low_id_reward_weight * low_id_normalized
 
-        # Compute advantage: peer-relative (within-sub-batch normalization) or baseline-based
-        if self.peer_relative_reward:
-            # Peer-relative: compare against games in the same sub-batch
-            # Games in same sub-batch faced identical cards, so differences are purely due
-            # to model decisions
-            advantage = self._compute_peer_relative_advantage(shaped_reward)
+        # Compute advantage: peer-relative or baseline-based
+        if self.peer_relative_reward and result.env_state is not None:
+            advantage = self._advantage_peer.compute(
+                shaped_reward,
+                result.env_state["n_sub_batches"],
+                result.env_state["current_sub_batch_size"],
+            )
         else:
-            # Traditional baseline-based advantage
-            advantage = shaped_reward - self.baseline
+            advantage = self._baseline_ema.compute(shaped_reward)
 
         loss = (-torch.sum(log_probs, 1) * advantage).mean()  # scalar
         self.optimizer.zero_grad()
@@ -595,13 +554,9 @@ class SoloLearningGame(BaseNNGame):
                 f"Loss: {loss.item():.2f}. "
                 f"Games: {n_training_games_played}"
             )
-        # Update the baseline EMA (use shaped_reward if reward shaping is enabled)
-        # In peer_relative_reward mode, baseline is not used for advantage but still
-        # tracked for monitoring
-        self.baseline = (
-            self.baseline
-            + self.rl_params["update_baseline_rate"] * (shaped_reward.mean() - self.baseline)
-        ).item()
+        # Update baseline EMA (for advantage when not peer-relative; always for monitoring)
+        self._baseline_ema.update(shaped_reward)
+        self.baseline = self._baseline_ema.baseline
         self.step_id += 1
 
         # Run periodic evaluations
