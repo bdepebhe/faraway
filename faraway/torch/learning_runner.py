@@ -14,6 +14,7 @@ import typer
 from loguru import logger
 
 from faraway.torch.base_game import BaseNNGame
+from faraway.torch.config_loader import DEFAULT_RL_PARAMS
 from faraway.torch.env import BatchedFarawayEnv
 from faraway.torch.learning import (
     AdvantageWithBaselineTracking,
@@ -22,6 +23,7 @@ from faraway.torch.learning import (
     PeerRelativeZScore,
     ReinforceAlgorithm,
     SoloSetting,
+    TemperatureConfig,
     Trainer,
 )
 from faraway.torch.learning.settings import Setting
@@ -60,12 +62,11 @@ class LearningRunner(BaseNNGame):
         model_params: dict[str, Any] | None = None,
         player_type: str = "mlp",
         player_params: dict[str, Any] | None = None,
-        optimizer_params: dict[str, Any] | None = None,
         rl_params: dict[str, Any] | None = None,
+        optimizer_params: dict[str, Any] | None = None,
         experiment_name: str | None = None,
         log_dir: str = "runs",
-        eval_vs_random_config: dict[str, Any] | None = None,
-        eval_solo_config: dict[str, Any] | None = None,
+        eval_flows: list[dict[str, Any]] | None = None,
         setting: Setting | None = None,
     ):
         super().__init__(
@@ -89,41 +90,48 @@ class LearningRunner(BaseNNGame):
             "use_cards_hand_in_state": False,
             "use_draft_indicator_in_model_input": False,
         }
-        self.optimizer_params = optimizer_params or {
-            "lr": 0.001,
-        }
-        self.rl_params = rl_params or {
-            "prior_baseline_score": 29,
-            "train_batch_size": 32,
-            "update_baseline_rate": 0.05,
-        }
-        self.peer_relative_reward = self.rl_params.get("peer_relative_reward", False)
-        self.advantage_peer_normalization = self.rl_params.get(
-            "advantage_peer_normalization", "zscore"
-        )
-        self.initial_temperature = self.rl_params.get("initial_temperature", 1.0)
-        self.temperature_decay = self.rl_params.get("temperature_decay", 1.0)
-        self.current_temperature = self.initial_temperature
-        self.peer_sub_batch_size = self.rl_params.get("peer_sub_batch_size", None)
         self.player_params["use_bonus_cards"] = self.use_bonus_cards
 
-        self._baseline_ema = BaselineEMA(
-            prior_baseline=self.rl_params["prior_baseline_score"],
-            update_rate=self.rl_params["update_baseline_rate"],
-        )
+        if rl_params is not None:
+            # Nested rl_params: each block uses its sub-dict as-is (no flat intermediate)
+            self.optimizer_params = rl_params.get("optimizer_params", {}) or {"lr": 0.001}
+            self.eval_flows = list(eval_flows) if eval_flows else []
+            self.rl_params = rl_params
+        else:
+            # CLI / eval_solo path: defaults + kwargs
+            from copy import deepcopy
+
+            nested = deepcopy(DEFAULT_RL_PARAMS)
+            if optimizer_params:
+                nested.setdefault("optimizer_params", {}).update(optimizer_params)
+            self.optimizer_params = nested.get("optimizer_params", {}) or {"lr": 0.001}
+            self.eval_flows = list(eval_flows) if eval_flows else []
+            self.rl_params = nested
+
+        adv_p = self.rl_params.get("advantage", {})
+        self.peer_relative_reward = adv_p.get("peer_relative_reward", False)
+        self.advantage_peer_normalization = adv_p.get("advantage_peer_normalization", "zscore")
+        self.peer_sub_batch_size = adv_p.get("peer_sub_batch_size", None)
+
+        self._baseline_ema = BaselineEMA(**adv_p)
         self.baseline = self._baseline_ema.baseline
         norm = self.advantage_peer_normalization
         self._advantage_peer = PeerRelativeZScore() if norm == "zscore" else PeerRelativeCenter()
-        self._algorithm = ReinforceAlgorithm(grad_clip=self.rl_params.get("grad_clip"))
+
+        self._algorithm = ReinforceAlgorithm(**self.rl_params.get("algorithm", {}))
+
+        temp_config = TemperatureConfig(**self.rl_params.get("temperature", {}))
+        self.initial_temperature = temp_config.initial
+        self.temperature_decay = temp_config.decay
+        self.current_temperature = self.initial_temperature
+
         self._setting = (
             setting
             if setting is not None
             else SoloSetting(
                 n_rounds=self.n_rounds,
                 use_bonus_cards=self.use_bonus_cards,
-                id_increase_reward_weight=self.rl_params.get("id_increase_reward_weight", 0.0),
-                bonus_reward_weight=self.rl_params.get("bonus_reward_weight", 0.0),
-                low_id_reward_weight=self.rl_params.get("low_id_reward_weight", 0.0),
+                **self.rl_params.get("setting", {}),
             )
         )
         self._advantage = AdvantageWithBaselineTracking(
@@ -132,9 +140,6 @@ class LearningRunner(BaseNNGame):
             ),
             baseline_ema=self._baseline_ema,
         )
-
-        self.eval_vs_random_config = eval_vs_random_config or {}
-        self.eval_solo_config = eval_solo_config or {}
 
         self._env = BatchedFarawayEnv(
             n_rounds=self.n_rounds,
@@ -157,7 +162,8 @@ class LearningRunner(BaseNNGame):
             model = torch.load(model_path)
         else:
             model = None
-        self._baseline_ema.baseline = self.rl_params["prior_baseline_score"]
+        adv_p = self.rl_params.get("advantage", {})
+        self._baseline_ema.baseline = adv_p.get("prior_baseline_score", 29)
         self.baseline = self._baseline_ema.baseline
         self.step_id = 0
 
@@ -193,15 +199,13 @@ class LearningRunner(BaseNNGame):
             algorithm=self._algorithm,
             learner=self.players[0],
             optimizer=self.optimizer,
-            batch_size=self.rl_params["train_batch_size"],
+            batch_size=self.rl_params.get("train_batch_size", 32),
             initial_temperature=self.initial_temperature,
             temperature_decay=self.temperature_decay,
             writer=self.writer,
             verbose=self.verbose,
-            eval_vs_random_config=self.eval_vs_random_config or None,
-            eval_solo_config=self.eval_solo_config or None,
-            on_eval_vs_random=self.run_eval_vs_random,
-            on_eval_solo=self.run_eval_solo,
+            eval_flows=self.eval_flows,
+            on_eval_flow=self.run_eval_flow,
         )
         self._trainer.step_id = 0
 
@@ -250,15 +254,27 @@ class LearningRunner(BaseNNGame):
             logger.info(f"Restored baseline: {self.baseline:.2f}")
         logger.info(f"Restored n_training_games_played: {self.players[0].n_training_games_played}")
 
-    def run_eval_vs_random(self) -> tuple[float, float]:
-        n_random_players = self.eval_vs_random_config.get("n_players", 1)
+    def run_eval_flow(self, flow: dict[str, Any]) -> Any:
+        """Run one evaluation flow. Dispatches by flow['type'] (e.g. 'solo', 'vs_random')."""
+        kind = flow.get("type", "solo")
+        if kind == "vs_random":
+            return self._run_eval_vs_random(flow)
+        if kind == "solo":
+            return self._run_eval_solo(flow)
+        logger.warning(f"Unknown eval flow type: {kind!r}, skipping")
+        return None
+
+    def _run_eval_vs_random(self, flow: dict[str, Any]) -> tuple[float, float]:
+        n_players = flow.get("n_players", 1)
+        n_batches = flow.get("n_batches", 100)
+        batch_size = flow.get("batch_size", 32)
         if self.verbose > 0:
-            logger.info(f"Running eval vs {n_random_players} random player(s)...")
+            logger.info(f"Running eval vs {n_players} random player(s)...")
         win_rate, mean_score = play_vs_random(
             player=self.players[0],
-            n_random_players=n_random_players,
-            n_eval_batches=self.eval_vs_random_config.get("n_batches", 100),
-            batch_size=self.eval_vs_random_config.get("batch_size", 32),
+            n_random_players=n_players,
+            n_eval_batches=n_batches,
+            batch_size=batch_size,
             writer=self.writer,
             verbose=0,
         )
@@ -266,9 +282,9 @@ class LearningRunner(BaseNNGame):
             logger.info(f"Eval vs random: win_rate={win_rate:.2%}, mean_score={mean_score:.2f}")
         return win_rate, mean_score
 
-    def run_eval_solo(self) -> float:
-        n_batches = self.eval_solo_config.get("n_batches", 100)
-        batch_size = self.eval_solo_config.get("batch_size", 32)
+    def _run_eval_solo(self, flow: dict[str, Any]) -> float:
+        n_batches = flow.get("n_batches", 100)
+        batch_size = flow.get("batch_size", 32)
         if self.verbose > 0:
             logger.info(f"Running solo eval ({n_batches} batches x {batch_size})...")
         scores = self.play_games_batches(n_batches=n_batches, batch_size=batch_size)
@@ -289,8 +305,10 @@ class LearningRunner(BaseNNGame):
         n_batches: int | None = None,
         batch_size: int | None = None,
     ) -> float:
-        n_batches = n_batches or self.eval_solo_config.get("n_batches", 50)
-        batch_size = batch_size or self.eval_solo_config.get("batch_size", 64)
+        if n_batches is None or batch_size is None:
+            solo_flow = next((f for f in self.eval_flows if f.get("type") == "solo"), None)
+            n_batches = n_batches or (solo_flow.get("n_batches", 50) if solo_flow else 50)
+            batch_size = batch_size or (solo_flow.get("batch_size", 64) if solo_flow else 64)
         if self.verbose > 0:
             logger.info(
                 f"Initializing baseline from solo eval ({n_batches} batches x {batch_size})..."
@@ -405,23 +423,28 @@ def main(
     else:
         logger.add(sys.stdout)
 
-    eval_vs_random_config: dict[str, Any] | None = None
+    eval_flows_list: list[dict[str, Any]] = []
     if eval_vs_random_every is not None:
-        eval_vs_random_config = {
-            "every": eval_vs_random_every,
-            "n_players": eval_vs_random_n_players,
-            "n_batches": n_eval_batches,
-            "batch_size": batch_size,
-            "initial_eval": True,
-        }
-    eval_solo_config: dict[str, Any] | None = None
+        eval_flows_list.append(
+            {
+                "type": "vs_random",
+                "every": eval_vs_random_every,
+                "n_players": eval_vs_random_n_players,
+                "n_batches": n_eval_batches,
+                "batch_size": batch_size,
+                "initial_eval": True,
+            }
+        )
     if eval_solo_every is not None:
-        eval_solo_config = {
-            "every": eval_solo_every,
-            "n_batches": n_eval_batches,
-            "batch_size": batch_size,
-            "initial_eval": True,
-        }
+        eval_flows_list.append(
+            {
+                "type": "solo",
+                "every": eval_solo_every,
+                "n_batches": n_eval_batches,
+                "batch_size": batch_size,
+                "initial_eval": True,
+            }
+        )
 
     if player_type == "mlp":
         model_params = {"hidden_layers_sizes": [512, 512], "dropout_rate": 0.1}
@@ -440,17 +463,19 @@ def main(
     else:
         raise ValueError(f"Unknown player type: {player_type}")
 
-    rl_params: dict[str, Any] = {
-        "prior_baseline_score": 29,
+    rl_params_nested: dict[str, Any] = {
         "train_batch_size": batch_size,
-        "update_baseline_rate": baseline_update_rate,
-        "peer_relative_reward": peer_relative_reward,
-        "advantage_peer_normalization": advantage_peer_normalization,
-        "initial_temperature": initial_temperature,
-        "temperature_decay": temperature_decay,
+        "advantage": {
+            "prior_baseline_score": 29,
+            "update_baseline_rate": baseline_update_rate,
+            "peer_relative_reward": peer_relative_reward,
+            "advantage_peer_normalization": advantage_peer_normalization,
+            "peer_sub_batch_size": None,
+        },
+        "algorithm": {"grad_clip": grad_clip},
+        "temperature": {"initial": initial_temperature, "decay": temperature_decay},
+        "optimizer_params": {"lr": lr},
     }
-    if grad_clip is not None:
-        rl_params["grad_clip"] = grad_clip
 
     runner = LearningRunner(
         verbose=2,
@@ -458,13 +483,11 @@ def main(
         model_params=model_params,
         player_params=player_params,
         player_type=player_type,
-        optimizer_params={"lr": lr},
-        rl_params=rl_params,
+        rl_params=rl_params_nested,
+        eval_flows=eval_flows_list if eval_flows_list else None,
         draft_size=draft_size,
         use_hand=use_hand,
         n_cards_hand=n_cards_hand,
-        eval_vs_random_config=eval_vs_random_config,
-        eval_solo_config=eval_solo_config,
     )
     runner.log_hparams({"n_steps": n_steps})
     for _ in range(n_steps):

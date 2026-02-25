@@ -38,10 +38,8 @@ class Trainer:
         temperature_decay: float = 1.0,
         writer: SummaryWriter | None = None,
         verbose: int = 0,
-        eval_vs_random_config: dict[str, Any] | None = None,
-        eval_solo_config: dict[str, Any] | None = None,
-        on_eval_vs_random: Callable[[], Any] | None = None,
-        on_eval_solo: Callable[[], Any] | None = None,
+        eval_flows: list[dict[str, Any]] | None = None,
+        on_eval_flow: Callable[[dict[str, Any]], Any] | None = None,
     ) -> None:
         self.env = env
         self.setting = setting
@@ -54,10 +52,8 @@ class Trainer:
         self.temperature_decay = temperature_decay
         self.writer = writer
         self.verbose = verbose
-        self.eval_vs_random_config = eval_vs_random_config or {}
-        self.eval_solo_config = eval_solo_config or {}
-        self.on_eval_vs_random = on_eval_vs_random
-        self.on_eval_solo = on_eval_solo
+        self.eval_flows = eval_flows or []
+        self.on_eval_flow = on_eval_flow
         self.step_id = 0
 
     def learning_step(self) -> None:
@@ -176,16 +172,9 @@ class Trainer:
 
         self.step_id += 1
 
-        if self.eval_vs_random_config and (
-            self.step_id % self.eval_vs_random_config.get("every", 500) == 0
-            or (self.step_id == 1 and self.eval_vs_random_config.get("initial_eval", False))
-        ):
-            if self.on_eval_vs_random is not None:
-                self.on_eval_vs_random()
-
-        if self.eval_solo_config and (
-            self.step_id % self.eval_solo_config.get("every", 500) == 0
-            or (self.step_id == 1 and self.eval_solo_config.get("initial_eval", False))
-        ):
-            if self.on_eval_solo is not None:
-                self.on_eval_solo()
+        for flow in self.eval_flows:
+            every = flow.get("every", 500)
+            initial_eval = flow.get("initial_eval", False)
+            due = self.step_id % every == 0 or (self.step_id == 1 and initial_eval)
+            if due and self.on_eval_flow is not None:
+                self.on_eval_flow(flow)

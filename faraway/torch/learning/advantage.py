@@ -10,15 +10,19 @@ import torch
 
 
 class BaselineEMA:
-    """Baseline-based advantage: advantage = reward - baseline; update baseline with EMA."""
+    """Baseline-based advantage: advantage = reward - baseline; update baseline with EMA.
+
+    Accepts config params as **kwargs (sklearn-style): prior_baseline_score, update_baseline_rate.
+    """
 
     def __init__(
         self,
-        prior_baseline: float = 29.0,
-        update_rate: float = 0.05,
-    ):
-        self.baseline = prior_baseline
-        self.update_rate = update_rate
+        prior_baseline_score: float = 29.0,
+        update_baseline_rate: float = 0.05,
+        **kwargs: object,
+    ) -> None:
+        self.baseline = prior_baseline_score
+        self.update_rate = update_baseline_rate
 
     def compute(self, reward: torch.Tensor, **kwargs: object) -> torch.Tensor:
         """Return advantage = reward - baseline (no in-place update)."""

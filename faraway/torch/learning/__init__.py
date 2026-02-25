@@ -9,6 +9,7 @@ from faraway.torch.learning.advantage import (
 from faraway.torch.learning.algorithms import ReinforceAlgorithm
 from faraway.torch.learning.rollout import RolloutResult, run_rollout
 from faraway.torch.learning.settings import SoloSetting
+from faraway.torch.learning.temperature import TemperatureConfig
 from faraway.torch.learning.trainer import Trainer
 
 __all__ = [
@@ -19,6 +20,7 @@ __all__ = [
     "ReinforceAlgorithm",
     "RolloutResult",
     "SoloSetting",
+    "TemperatureConfig",
     "Trainer",
     "run_rollout",
 ]
