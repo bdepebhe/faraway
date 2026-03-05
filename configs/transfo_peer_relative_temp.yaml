@@ -1,8 +1,5 @@
-# Large transformer config
-# Higher capacity model for longer training
-#
-# Usage:
-#   python -m faraway.torch.main configs/transformer_large.yaml
+# Transformer peer-relative with temperature scheduling
+# Usage: python -m faraway.torch.run_experiment configs/transfo_peer_relative_temp.yaml
 
 experiment_name: "transfo_peer_relative_temp2"
 
@@ -20,8 +17,9 @@ model_params:
   n_transformer_layers: 3
   dropout_rate: 0.1
 
-optimizer_params:
-  lr: 0.001
+rl_params:
+  optimizer_params:
+    lr: 0.001
 
 player_params:
   use_mode_embedding: true
@@ -29,24 +27,27 @@ player_params:
 phases:
   - name: "main_training"
     n_steps: 15000
-    eval_vs_random_config:
-      every: 200
-      n_players: 1
-      n_batches: 50
-      batch_size: 64
-      initial_eval: true
-    eval_solo_config:
-      every: 200
-      n_batches: 50
-      batch_size: 64
-      initial_eval: true
     rl_params:
       train_batch_size: 128
-      update_baseline_rate: 0.02
-      peer_relative_reward: true
-      advantage_peer_normalization: "center"
-      peer_sub_batch_size: 16
-      initial_temperature: 10.0
-      temperature_decay: 0.9999
-    optimizer_params:
-      lr: 0.0001
+      advantage:
+        update_baseline_rate: 0.02
+        peer_relative_reward: true
+        advantage_peer_normalization: "center"
+        peer_sub_batch_size: 16
+      temperature:
+        initial: 10.0
+        decay: 0.9999
+      optimizer_params:
+        lr: 0.0001
+    eval_flows:
+      - type: vs_random
+        every: 200
+        n_players: 1
+        n_batches: 50
+        batch_size: 64
+        initial_eval: true
+      - type: solo
+        every: 200
+        n_batches: 50
+        batch_size: 64
+        initial_eval: true
