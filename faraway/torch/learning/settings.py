@@ -1,5 +1,5 @@
 """
-Setting interface: who plays and how reward is derived from scores.
+LearningSetting interface: who plays and how reward is derived from scores.
 
 - build_players(learner, env) -> list of players
 - learner_index: int
@@ -13,7 +13,7 @@ import torch
 from faraway.torch.env import BatchedFarawayEnv, PlayerLike
 
 
-class Setting(Protocol):
+class LearningSetting(Protocol):
     """Who plays; how reward is derived from scores."""
 
     learner_index: int
@@ -37,7 +37,7 @@ class Setting(Protocol):
         ...
 
 
-class SoloSetting:
+class SoloLearningSetting:
     """One player (learner); reward = score + optional shaping (id/bonus/low_id)."""
 
     learner_index = 0

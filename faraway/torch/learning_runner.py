@@ -1,7 +1,7 @@
 """
-Setting-agnostic learning runner: env + setting + advantage + algorithm + trainer.
+LearningSetting-agnostic learning runner: env + setting + advantage + algorithm + trainer.
 
-Default setting is SoloSetting (solo play with optional reward shaping). Pass a different
+Default setting is SoloLearningSetting (solo play with optional reward shaping). Pass a different
 setting (e.g. VsRandomSetting, SelfPlaySetting) to run other modes. Same API for
 run_experiment, eval, and CLI.
 """
@@ -19,14 +19,14 @@ from faraway.torch.env import BatchedFarawayEnv
 from faraway.torch.learning import (
     AdvantageWithBaselineTracking,
     BaselineEMA,
+    LearningSetting,
     PeerRelativeCenter,
     PeerRelativeZScore,
     ReinforceAlgorithm,
-    SoloSetting,
+    SoloLearningSetting,
     TemperatureConfig,
     Trainer,
 )
-from faraway.torch.learning.settings import Setting
 from faraway.torch.mlp_player import MLPPlayer
 from faraway.torch.nn_player import BaseNNPlayer
 from faraway.torch.play_vs_random import play_vs_random
@@ -42,10 +42,10 @@ def sample_cards_from_availability_tensor(
 
 class LearningRunner(BaseNNGame):
     """
-    Setting-agnostic learning runner: env + setting + advantage + algorithm + trainer.
+    LearningSetting-agnostic learning runner: env + setting + advantage + algorithm + trainer.
 
-    Use default setting=None for solo play (SoloSetting with reward shaping from rl_params).
-    Pass a Setting implementation (e.g. VsRandomSetting in Phase F) to run other modes.
+    Use default setting=None for solo play (SoloLearningSetting with reward shaping from rl_params).
+    Pass a LearningSetting implementation (e.g. VsRandomSetting in Phase F) to run other modes.
     """
 
     def __init__(
@@ -67,7 +67,7 @@ class LearningRunner(BaseNNGame):
         experiment_name: str | None = None,
         log_dir: str = "runs",
         eval_flows: list[dict[str, Any]] | None = None,
-        setting: Setting | None = None,
+        setting: LearningSetting | None = None,
     ):
         super().__init__(
             n_rounds,
@@ -128,7 +128,7 @@ class LearningRunner(BaseNNGame):
         self._setting = (
             setting
             if setting is not None
-            else SoloSetting(
+            else SoloLearningSetting(
                 n_rounds=self.n_rounds,
                 use_bonus_cards=self.use_bonus_cards,
                 **self.rl_params.get("setting", {}),

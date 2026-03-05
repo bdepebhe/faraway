@@ -13,9 +13,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from faraway.torch.env import BatchedFarawayEnv
 from faraway.torch.learning.rollout import run_rollout
-
-# Algorithm and advantage are typed as having the right methods (Protocol/duck typing)
-# to avoid circular imports; concrete types come from learning_runner.
+from faraway.torch.learning.settings import LearningSetting
 
 
 def _get_baseline(advantage: Any) -> float:
@@ -28,7 +26,7 @@ class Trainer:
     def __init__(
         self,
         env: BatchedFarawayEnv,
-        setting: Any,
+        setting: LearningSetting,
         advantage: Any,
         algorithm: Any,
         learner: Any,
